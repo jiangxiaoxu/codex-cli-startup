@@ -1448,16 +1448,11 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            archived_path = self._repository.archive_thread(thread.thread_id)
+            self._repository.archive_thread(thread.thread_id)
         except Exception as error:  # noqa: BLE001
             QMessageBox.critical(self, "Archive Failed", str(error))
             return
 
-        QMessageBox.information(
-            self,
-            "Archive Thread",
-            f"Thread was archived.\n\nArchived rollout:\n{archived_path}",
-        )
         self._refresh_threads()
 
     def _unarchive_selected_thread(self) -> None:
