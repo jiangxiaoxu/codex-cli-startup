@@ -12,12 +12,12 @@ from typing import Sequence
 PROJECT_ROOT = Path(__file__).resolve().parent
 WRAPPER_PROJECT = PROJECT_ROOT / "launcher_wrapper" / "CodexWorkspaceLauncherWrapper.csproj"
 PUBLISH_DIR = PROJECT_ROOT / ".launcher_wrapper_publish"
-OUTPUT_PATH = PROJECT_ROOT / "launch_launcher.exe"
+OUTPUT_PATH = PROJECT_ROOT / "codex-cli-startup.exe"
 OUTPUT_FILES = (
-    "launch_launcher.deps.json",
-    "launch_launcher.dll",
-    "launch_launcher.exe",
-    "launch_launcher.runtimeconfig.json",
+    "codex-cli-startup.deps.json",
+    "codex-cli-startup.dll",
+    "codex-cli-startup.exe",
+    "codex-cli-startup.runtimeconfig.json",
 )
 
 

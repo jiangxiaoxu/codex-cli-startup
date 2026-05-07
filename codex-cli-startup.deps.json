@@ -7,15 +7,15 @@
   "targets": {
     ".NETCoreApp,Version=v10.0": {},
     ".NETCoreApp,Version=v10.0/win-x64": {
-      "launch_launcher/1.0.0": {
+      "codex-cli-startup/1.0.0": {
         "runtime": {
-          "launch_launcher.dll": {}
+          "codex-cli-startup.dll": {}
         }
       }
     }
   },
   "libraries": {
-    "launch_launcher/1.0.0": {
+    "codex-cli-startup/1.0.0": {
       "type": "project",
       "serviceable": false,
       "sha512": ""

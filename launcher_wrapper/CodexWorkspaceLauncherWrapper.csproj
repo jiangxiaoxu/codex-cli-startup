@@ -2,7 +2,7 @@
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
     <TargetFramework>net10.0-windows</TargetFramework>
-    <AssemblyName>launch_launcher</AssemblyName>
+    <AssemblyName>codex-cli-startup</AssemblyName>
     <RootNamespace>CodexWorkspaceLauncher.Wrapper</RootNamespace>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>

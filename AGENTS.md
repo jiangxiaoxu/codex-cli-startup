@@ -10,8 +10,8 @@
 - `launcher.pyw`: windowed Python 入口
 - `setup_env.py`: 项目 `.venv` 准备脚本
 - `build_wrapper.py`: 轻量 exe wrapper 构建入口
-- `launch_launcher.exe`: 已入库的轻量源码启动 wrapper
-- `launch_launcher.dll`,`launch_launcher.deps.json`,`launch_launcher.runtimeconfig.json`: wrapper 运行所需的 .NET sidecar files
+- `codex-cli-startup.exe`: 已入库的轻量源码启动 wrapper
+- `codex-cli-startup.dll`,`codex-cli-startup.deps.json`,`codex-cli-startup.runtimeconfig.json`: wrapper 运行所需的 .NET sidecar files
 - `launcher_wrapper/`: 轻量 exe wrapper 的 C# 源码
 - `build_exe.py`: PyInstaller 构建入口
 - `CodexWorkspaceLauncher.spec`: PyInstaller spec
@@ -50,8 +50,8 @@ python setup_env.py --build
 ```
 
 - 运行,验证和构建命令默认使用 `.venv\Scripts\python.exe`,除非任务明确要求验证宿主 Python 行为。
-- 双击源码版 GUI 时优先使用已入库的 `launch_launcher.exe`; 该 wrapper 会通过 `.venv\Scripts\pythonw.exe` 启动 `launcher.py`,如果 `.venv` 不存在则回退到 `pythonw.exe`。
-- `launch_launcher.exe` 依赖同目录的 `launch_launcher.dll`,`launch_launcher.deps.json`,`launch_launcher.runtimeconfig.json`,更新 wrapper 时需要一起入库。
+- 双击源码版 GUI 时优先使用已入库的 `codex-cli-startup.exe`; 该 wrapper 会通过 `.venv\Scripts\pythonw.exe` 启动 `launcher.py`,如果 `.venv` 不存在则回退到 `pythonw.exe`。
+- `codex-cli-startup.exe` 依赖同目录的 `codex-cli-startup.dll`,`codex-cli-startup.deps.json`,`codex-cli-startup.runtimeconfig.json`,更新 wrapper 时需要一起入库。
 - 重新生成轻量 wrapper exe 时运行:
 
 ```powershell
@@ -117,7 +117,7 @@ python setup_env.py --build
 
 - `dist/CodexWorkspaceLauncher.exe`
 
-不要提交生成的 `build/`,`dist/`,`.launcher_wrapper_publish/` 目录。轻量 wrapper 的 `launch_launcher.exe`,`launch_launcher.dll`,`launch_launcher.deps.json`,`launch_launcher.runtimeconfig.json` 是例外,需要跟随 wrapper 源码更新并入库。除非有意修改 PyInstaller 配置,否则不要改动 `CodexWorkspaceLauncher.spec`。
+不要提交生成的 `build/`,`dist/`,`.launcher_wrapper_publish/` 目录。轻量 wrapper 的 `codex-cli-startup.exe`,`codex-cli-startup.dll`,`codex-cli-startup.deps.json`,`codex-cli-startup.runtimeconfig.json` 是例外,需要跟随 wrapper 源码更新并入库。除非有意修改 PyInstaller 配置,否则不要改动 `CodexWorkspaceLauncher.spec`。
 
 ## PowerShell
 
