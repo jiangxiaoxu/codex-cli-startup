@@ -6,7 +6,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(SPECPATH)
 
 a = Analysis(
-    ["launcher.pyw"],
+    ["codex-cli-startup.py"],
     pathex=[str(PROJECT_ROOT)],
     binaries=[],
     datas=[],
@@ -26,7 +26,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name="CodexWorkspaceLauncher",
+    name="codex-cli-startup",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

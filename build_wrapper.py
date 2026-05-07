@@ -10,7 +10,7 @@ from typing import Sequence
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-WRAPPER_PROJECT = PROJECT_ROOT / "launcher_wrapper" / "CodexWorkspaceLauncherWrapper.csproj"
+WRAPPER_PROJECT = PROJECT_ROOT / "launcher_wrapper" / "CodexCliStartupWrapper.csproj"
 PUBLISH_DIR = PROJECT_ROOT / ".launcher_wrapper_publish"
 OUTPUT_PATH = PROJECT_ROOT / "codex-cli-startup.exe"
 OUTPUT_FILES = (

@@ -4,7 +4,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
 
-namespace CodexWorkspaceLauncher.Wrapper;
+namespace CodexCliStartup.Wrapper;
 
 internal static class Program
 {
@@ -15,13 +15,13 @@ internal static class Program
     {
         string executablePath = Environment.ProcessPath ?? AppContext.BaseDirectory;
         string launcherDirectory = Path.GetDirectoryName(executablePath) ?? AppContext.BaseDirectory;
-        string launcherPath = Path.Combine(launcherDirectory, "launcher.py");
+        string launcherPath = Path.Combine(launcherDirectory, "codex-cli-startup.py");
         string venvPythonwPath = Path.Combine(launcherDirectory, ".venv", "Scripts", "pythonw.exe");
         string pythonwPath = File.Exists(venvPythonwPath) ? venvPythonwPath : "pythonw.exe";
 
         if (!File.Exists(launcherPath))
         {
-            ShowError($"launcher.py was not found in:{Environment.NewLine}{launcherDirectory}");
+            ShowError($"codex-cli-startup.py was not found in:{Environment.NewLine}{launcherDirectory}");
             return 1;
         }
 
@@ -53,7 +53,7 @@ internal static class Program
 
     private static void ShowError(string message)
     {
-        _ = MessageBox(IntPtr.Zero, message, "Codex Workspace Launcher", MessageBoxIconError);
+        _ = MessageBox(IntPtr.Zero, message, "codex-cli-startup", MessageBoxIconError);
     }
 
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]

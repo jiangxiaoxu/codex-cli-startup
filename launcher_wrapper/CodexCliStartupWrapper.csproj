@@ -3,7 +3,7 @@
     <OutputType>WinExe</OutputType>
     <TargetFramework>net10.0-windows</TargetFramework>
     <AssemblyName>codex-cli-startup</AssemblyName>
-    <RootNamespace>CodexWorkspaceLauncher.Wrapper</RootNamespace>
+    <RootNamespace>CodexCliStartup.Wrapper</RootNamespace>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
   </PropertyGroup>

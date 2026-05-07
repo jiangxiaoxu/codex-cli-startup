@@ -7,8 +7,8 @@ from pathlib import Path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-SPEC_PATH = PROJECT_ROOT / "CodexWorkspaceLauncher.spec"
-OUTPUT_PATH = PROJECT_ROOT / "dist" / "CodexWorkspaceLauncher.exe"
+SPEC_PATH = PROJECT_ROOT / "codex-cli-startup.spec"
+OUTPUT_PATH = PROJECT_ROOT / "dist" / "codex-cli-startup.exe"
 
 
 def ensure_pyinstaller_available() -> None:
@@ -20,7 +20,7 @@ def ensure_pyinstaller_available() -> None:
 
     if importlib.util.find_spec("PyInstaller") is None:
         raise RuntimeError(
-            "PyInstaller is not installed. Run: python -m pip install -r requirements-build.txt"
+            "PyInstaller is not installed. Run: python setup_env.py --build"
         )
 
 

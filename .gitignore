@@ -23,6 +23,7 @@ launcher_wrapper/obj/
 
 # Local launcher state
 launcher_config.json
+codex-cli-startup_config.json
 
 # Virtual environments
 .venv

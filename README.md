@@ -1,4 +1,4 @@
-# Codex Workspace Launcher
+# codex-cli-startup
 
 这是一个 Windows 专用的 Python GUI 启动器,用于管理常用工作区,并一键恢复 Codex chat threads。
 
@@ -15,18 +15,18 @@ python setup_env.py
 ## 启动
 
 ```powershell
-.\.venv\Scripts\python.exe launcher.py
+.\.venv\Scripts\python.exe codex-cli-startup.py
 ```
 
 Windows 下如果你不想看到额外的空白控制台窗口,优先使用:
 
 ```powershell
-.\.venv\Scripts\pythonw.exe launcher.pyw
+.\.venv\Scripts\pythonw.exe codex-cli-startup.pyw
 ```
 
-也可以直接双击 [launcher.pyw](G:\Project\codex-cli-startup\launcher.pyw)。
+也可以直接双击 [codex-cli-startup.pyw](G:\Project\codex-cli-startup\codex-cli-startup.pyw)。
 
-仓库根目录还包含已入库的 `codex-cli-startup.exe`,双击它会通过 `.venv\Scripts\pythonw.exe` 拉起 `launcher.py`。如果 `.venv` 不存在,它会回退到 `pythonw.exe`。这个 wrapper 依赖同目录的 `codex-cli-startup.dll`,`codex-cli-startup.deps.json`,`codex-cli-startup.runtimeconfig.json`。
+仓库根目录还包含已入库的 `codex-cli-startup.exe`,双击它会通过 `.venv\Scripts\pythonw.exe` 拉起 `codex-cli-startup.py`。如果 `.venv` 不存在,它会回退到 `pythonw.exe`。这个 wrapper 依赖同目录的 `codex-cli-startup.dll`,`codex-cli-startup.deps.json`,`codex-cli-startup.runtimeconfig.json`。
 
 重新生成这个轻量 wrapper:
 
@@ -48,14 +48,14 @@ python setup_env.py --build
 .\.venv\Scripts\python.exe build_exe.py
 ```
 
-生成的入口位于 [dist/CodexWorkspaceLauncher.exe](G:\Project\codex-cli-startup\dist\CodexWorkspaceLauncher.exe)。
+生成的入口位于 [dist/codex-cli-startup.exe](G:\Project\codex-cli-startup\dist\codex-cli-startup.exe)。
 
-exe 使用 `--windowed` 模式,启动时不会显示控制台窗口。打包后配置文件会读写在 exe 同目录的 `launcher_config.json`,方便把 `dist` 目录整体挪到固定位置后直接双击运行。
+exe 使用 `--windowed` 模式,启动时不会显示控制台窗口。打包后配置文件会读写在 exe 同目录的 `codex-cli-startup_config.json`,方便把 `dist` 目录整体挪到固定位置后直接双击运行。
 
 ## 配置文件位置
 
-配置文件保存在入口所在目录的 `launcher_config.json`。
-源码运行时对应仓库根目录的 [launcher_config.json](G:\Project\codex-cli-startup\launcher_config.json),exe 运行时对应 exe 同目录的 `launcher_config.json`。
+配置文件保存在入口所在目录的 `codex-cli-startup_config.json`。
+源码运行时对应仓库根目录的 [codex-cli-startup_config.json](G:\Project\codex-cli-startup\codex-cli-startup_config.json),exe 运行时对应 exe 同目录的 `codex-cli-startup_config.json`。如果只存在旧的 `launcher_config.json`,应用会读取它并保存一份新配置文件。
 
 结构包含:
 
