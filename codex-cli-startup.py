@@ -68,9 +68,7 @@ SCRIPT_DIR = resolve_app_dir()
 APP_ICON_PATH = resolve_resource_path("assets/codex-cli-startup.ico")
 APP_USER_MODEL_ID = "codex-cli-startup.app"
 CONFIG_FILENAME = "codex-cli-startup_config.json"
-LEGACY_CONFIG_FILENAME = "launcher_config.json"
 CONFIG_PATH = SCRIPT_DIR / CONFIG_FILENAME
-LEGACY_CONFIG_PATH = SCRIPT_DIR / LEGACY_CONFIG_FILENAME
 DEFAULT_WINDOW_SIZE = (1280, 780)
 DEFAULT_SPLITTER_SIZES = (320, 960)
 DEFAULT_COLUMN_WIDTHS = (520, 165, 100)
@@ -391,21 +389,16 @@ def load_app_config(config_path: Path) -> AppConfig:
     @returns The parsed application config.
     """
 
-    target_config_path = config_path
-    read_config_path = config_path
-    if config_path == CONFIG_PATH and not config_path.exists() and LEGACY_CONFIG_PATH.exists():
-        read_config_path = LEGACY_CONFIG_PATH
-
-    if not read_config_path.exists():
+    if not config_path.exists():
         config = AppConfig()
-        save_app_config(target_config_path, config)
+        save_app_config(config_path, config)
         return config
 
     try:
-        raw_data = json.loads(read_config_path.read_text(encoding="utf-8"))
+        raw_data = json.loads(config_path.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
         config = AppConfig()
-        save_app_config(target_config_path, config)
+        save_app_config(config_path, config)
         return config
     raw_workspaces = raw_data.get("workspaces", [])
     workspaces: list[WorkspaceEntry] = []
@@ -442,10 +435,7 @@ def load_app_config(config_path: Path) -> AppConfig:
         ui_state.splitter_sizes = DEFAULT_SPLITTER_SIZES
 
     terminal = str(raw_data.get("terminal", "wt")).strip() or "wt"
-    config = AppConfig(workspaces=workspaces, terminal=terminal, ui_state=ui_state)
-    if read_config_path != target_config_path:
-        save_app_config(target_config_path, config)
-    return config
+    return AppConfig(workspaces=workspaces, terminal=terminal, ui_state=ui_state)
 
 
 def save_app_config(config_path: Path, config: AppConfig) -> None:

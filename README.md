@@ -57,7 +57,7 @@ exe 使用 `--windowed` 模式,启动时不会显示控制台窗口。打包后�
 ## 配置文件位置
 
 配置文件保存在入口所在目录的 `codex-cli-startup_config.json`。
-源码运行时对应仓库根目录的 [codex-cli-startup_config.json](G:\Project\codex-cli-startup\codex-cli-startup_config.json),exe 运行时对应 exe 同目录的 `codex-cli-startup_config.json`。如果只存在旧的 `launcher_config.json`,应用会读取它并保存一份新配置文件。
+源码运行时对应仓库根目录的 [codex-cli-startup_config.json](G:\Project\codex-cli-startup\codex-cli-startup_config.json),exe 运行时对应 exe 同目录的 `codex-cli-startup_config.json`。
 
 结构包含:
 
