@@ -15,9 +15,10 @@ from pathlib import Path
 from typing import Sequence
 
 from PySide6.QtCore import QModelIndex, QRect, Qt
-from PySide6.QtGui import QCloseEvent, QColor, QIcon, QPainter
+from PySide6.QtGui import QBrush, QCloseEvent, QColor, QIcon, QPainter
 from PySide6.QtWidgets import (
     QApplication,
+    QButtonGroup,
     QDialog,
     QFileDialog,
     QGridLayout,
@@ -71,7 +72,7 @@ CONFIG_FILENAME = "codex-cli-startup_config.json"
 CONFIG_PATH = SCRIPT_DIR / CONFIG_FILENAME
 DEFAULT_WINDOW_SIZE = (1280, 780)
 DEFAULT_SPLITTER_SIZES = (320, 960)
-DEFAULT_COLUMN_WIDTHS = (520, 165, 100)
+DEFAULT_COLUMN_WIDTHS = (420, 260, 165, 100)
 ROLLOUT_FILE_PATTERN = re.compile(r"^rollout-(\d{4})-(\d{2})-(\d{2})T.+-[0-9a-fA-F-]+\.jsonl$")
 PROCESS_UUID_PATTERN = re.compile(r"^pid:(\d+):.+$")
 CODEX_LOGS_DB_FILENAME = "logs_2.sqlite"
@@ -79,8 +80,10 @@ ACTIVE_ROLLOUT_MTIME_GRACE_SECONDS = 90
 ACTIVE_THREAD_ARCHIVE_MESSAGE = "Thread appears active. Exit the Codex session before archiving."
 THREAD_SCOPE_WORKSPACE = "workspace"
 THREAD_SCOPE_ALL_WORKSPACES = "all_workspaces"
+THREAD_SCOPE_OTHER_WORKSPACES = "other_workspaces"
 THREAD_VIEW_CHATS = "chats"
 ALL_WORKSPACES_SELECTION = "__all_workspaces__"
+OTHER_WORKSPACES_SELECTION = "__other_workspaces__"
 INTERACTIVE_CHAT_SOURCES = {"cli", "vscode", "codex", "atlas", "chatgpt"}
 
 
@@ -136,6 +139,7 @@ class ThreadRecord:
     first_user_message: str
     summary: str
     archived: bool
+    rollout_missing: bool
     sort_timestamp: int
 
 
@@ -425,7 +429,11 @@ def load_app_config(config_path: Path) -> AppConfig:
         splitter_sizes=_coerce_int_sequence(raw_ui_state.get("splitter_sizes"), DEFAULT_SPLITTER_SIZES)[:2],
         column_widths=_coerce_int_sequence(raw_ui_state.get("column_widths"), DEFAULT_COLUMN_WIDTHS),
     )
-    if ui_state.thread_scope not in {THREAD_SCOPE_WORKSPACE, THREAD_SCOPE_ALL_WORKSPACES}:
+    if ui_state.thread_scope not in {
+        THREAD_SCOPE_WORKSPACE,
+        THREAD_SCOPE_ALL_WORKSPACES,
+        THREAD_SCOPE_OTHER_WORKSPACES,
+    }:
         ui_state.thread_scope = THREAD_SCOPE_WORKSPACE
     if ui_state.thread_view != THREAD_VIEW_CHATS:
         ui_state.thread_view = THREAD_VIEW_CHATS
@@ -501,6 +509,7 @@ class ThreadRepository:
         archived_only: bool,
         thread_scope: str,
         thread_view: str,
+        known_workspace_paths: Sequence[str] = (),
     ) -> list[ThreadRecord]:
         """Load threads from the SQLite index.
 
@@ -508,17 +517,25 @@ class ThreadRepository:
         @param archived_only Whether only archived threads should be shown.
         @param thread_scope The workspace scope to apply.
         @param thread_view The thread view filter to apply.
+        @param known_workspace_paths The configured workspace paths used by the Other scope.
         @returns A list of threads sorted by most recent update.
         """
 
         if not self._database_path.exists():
             raise FileNotFoundError(f"Codex state database was not found: {self._database_path}")
 
-        if thread_scope not in {THREAD_SCOPE_WORKSPACE, THREAD_SCOPE_ALL_WORKSPACES}:
+        if thread_scope not in {
+            THREAD_SCOPE_WORKSPACE,
+            THREAD_SCOPE_ALL_WORKSPACES,
+            THREAD_SCOPE_OTHER_WORKSPACES,
+        }:
             thread_scope = THREAD_SCOPE_WORKSPACE
         if thread_view != THREAD_VIEW_CHATS:
             thread_view = THREAD_VIEW_CHATS
         normalized_workspace = normalize_workspace_path(workspace_path)
+        normalized_known_workspaces = {
+            normalize_workspace_path(path_text) for path_text in known_workspace_paths if path_text.strip()
+        }
         database_uri = f"file:{self._database_path}?mode=ro"
         connection = sqlite3.connect(database_uri, uri=True)
         connection.row_factory = sqlite3.Row
@@ -575,6 +592,8 @@ class ThreadRepository:
             cwd = str(row["cwd"] or "")
             if thread_scope == THREAD_SCOPE_WORKSPACE and normalize_workspace_path(cwd) != normalized_workspace:
                 continue
+            if thread_scope == THREAD_SCOPE_OTHER_WORKSPACES and normalize_workspace_path(cwd) in normalized_known_workspaces:
+                continue
 
             archived_flag = bool(int(row["archived"] or 0))
             if archived_flag != archived_only:
@@ -606,6 +625,7 @@ class ThreadRepository:
                     first_user_message=first_user_message,
                     summary=summary,
                     archived=archived_flag,
+                    rollout_missing=self._rollout_missing(str(row["rollout_path"] or ""), thread_id, archived_flag),
                     sort_timestamp=sort_timestamp,
                 )
             )
@@ -750,19 +770,55 @@ class ThreadRepository:
         finally:
             connection.close()
 
-    def delete_archived_threads(self, workspace_path: str, thread_scope: str, thread_view: str) -> int:
+    def delete_archived_threads(
+        self,
+        workspace_path: str,
+        thread_scope: str,
+        thread_view: str,
+        known_workspace_paths: Sequence[str] = (),
+    ) -> int:
         """Delete archived threads matching the current workspace and view filters.
 
         @param workspace_path The selected workspace path.
         @param thread_scope The workspace scope to apply.
         @param thread_view The thread view filter to apply.
+        @param known_workspace_paths The configured workspace paths used by the Other scope.
         @returns The number of deleted archived threads.
         """
 
-        records = self.load_threads(workspace_path, True, thread_scope, thread_view)
+        records = self.load_threads(workspace_path, True, thread_scope, thread_view, known_workspace_paths)
         deleted_count = 0
         for record in records:
             self.delete_archived_thread(record.thread_id)
+            deleted_count += 1
+        return deleted_count
+
+    def delete_missing_rollout_threads(
+        self,
+        workspace_path: str,
+        archived_only: bool,
+        thread_scope: str,
+        thread_view: str,
+        known_workspace_paths: Sequence[str] = (),
+    ) -> int:
+        """Delete stale SQLite rows whose rollout file no longer exists.
+
+        @param workspace_path The selected workspace path.
+        @param archived_only Whether only archived threads are currently shown.
+        @param thread_scope The workspace scope to apply.
+        @param thread_view The thread view filter to apply.
+        @param known_workspace_paths The configured workspace paths used by the Other scope.
+        @returns The number of deleted stale rows.
+        """
+
+        records = self.load_threads(workspace_path, archived_only, thread_scope, thread_view, known_workspace_paths)
+        deleted_count = 0
+        for record in records:
+            if not record.rollout_missing:
+                continue
+            if not record.archived and self.thread_has_live_process(record.thread_id):
+                continue
+            self._delete_thread_index_row(record.thread_id)
             deleted_count += 1
         return deleted_count
 
@@ -775,17 +831,34 @@ class ThreadRepository:
         """
 
         sessions_root = self._codex_home_path / "sessions"
-        candidates: list[Path] = []
         if rollout_path_text:
             stored_path = Path(rollout_path_text)
-            candidates.append(stored_path if stored_path.is_absolute() else self._codex_home_path / stored_path)
-        if sessions_root.exists():
-            candidates.extend(sessions_root.rglob(f"*{thread_id}*.jsonl"))
-
-        for candidate in candidates:
+            candidate = stored_path if stored_path.is_absolute() else self._codex_home_path / stored_path
             if candidate.exists() and candidate.is_file() and self._is_path_under(candidate, sessions_root):
                 return candidate
+        if sessions_root.exists():
+            for candidate in sessions_root.rglob(f"*{thread_id}*.jsonl"):
+                if candidate.exists() and candidate.is_file() and self._is_path_under(candidate, sessions_root):
+                    return candidate
         raise FileNotFoundError(f"Active rollout was not found for thread: {thread_id}")
+
+    def _rollout_missing(self, rollout_path_text: str, thread_id: str, archived: bool) -> bool:
+        """Return whether a thread index row has no matching rollout file.
+
+        @param rollout_path_text The rollout path stored in SQLite.
+        @param thread_id The thread id to locate.
+        @param archived Whether the thread is marked archived in SQLite.
+        @returns True when no matching rollout exists in the expected tree.
+        """
+
+        try:
+            if archived:
+                self._resolve_archived_rollout_path(rollout_path_text, thread_id)
+            else:
+                self._resolve_active_rollout_path(rollout_path_text, thread_id)
+        except FileNotFoundError:
+            return True
+        return False
 
     def thread_has_live_process(self, thread_id: str) -> bool:
         """Return whether Codex logs point to a still-running process for a thread.
@@ -795,6 +868,32 @@ class ThreadRepository:
         """
 
         return self._has_live_log_process(thread_id)
+
+    def _delete_thread_index_row(self, thread_id: str) -> None:
+        """Delete one SQLite thread row and its spawn edges.
+
+        @param thread_id The thread id to delete from the SQLite index.
+        @returns None.
+        """
+
+        database_uri = f"file:{self._database_path}"
+        connection = sqlite3.connect(database_uri, uri=True)
+        try:
+            connection.execute("DELETE FROM threads WHERE id = ?", (thread_id,))
+            if self._table_exists(connection, "thread_spawn_edges"):
+                connection.execute(
+                    """
+                    DELETE FROM thread_spawn_edges
+                    WHERE parent_thread_id = ? OR child_thread_id = ?
+                    """,
+                    (thread_id, thread_id),
+                )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
     def _thread_may_be_active_for_archive(self, thread_id: str, rollout_path: Path) -> bool:
         """Return whether a thread should be protected from archive.
@@ -912,16 +1011,15 @@ class ThreadRepository:
         """
 
         archived_root = self._codex_home_path / "archived_sessions"
-        candidates: list[Path] = []
         if rollout_path_text:
             stored_path = Path(rollout_path_text)
-            candidates.append(stored_path if stored_path.is_absolute() else self._codex_home_path / stored_path)
-        if archived_root.exists():
-            candidates.extend(archived_root.rglob(f"*{thread_id}*.jsonl"))
-
-        for candidate in candidates:
+            candidate = stored_path if stored_path.is_absolute() else self._codex_home_path / stored_path
             if candidate.exists() and candidate.is_file() and self._is_path_under(candidate, archived_root):
                 return candidate
+        if archived_root.exists():
+            for candidate in archived_root.rglob(f"*{thread_id}*.jsonl"):
+                if candidate.exists() and candidate.is_file() and self._is_path_under(candidate, archived_root):
+                    return candidate
         raise FileNotFoundError(f"Archived rollout was not found for thread: {thread_id}")
 
     def _restore_archived_rollout(self, archived_path: Path) -> Path:
@@ -1054,6 +1152,7 @@ class MainWindow(QMainWindow):
         self._config = load_app_config(config_path)
         self._repository = ThreadRepository(state_db_path, codex_home_path)
         self._threads: list[ThreadRecord] = []
+        self._missing_rollout_count = 0
 
         self.setWindowTitle("codex-cli-startup")
         self.resize(*self._config.ui_state.window_size)
@@ -1079,17 +1178,61 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(self._workspace_list, 1)
         left_layout.addLayout(left_buttons)
 
-        self._archived_toggle = QPushButton("Archived only")
-        self._archived_toggle.setCheckable(True)
+        self._active_threads_button = QPushButton("Active")
+        self._archived_toggle = QPushButton("Archived")
+        for button in (self._active_threads_button, self._archived_toggle):
+            button.setCheckable(True)
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._archive_mode_group = QButtonGroup(self)
+        self._archive_mode_group.setExclusive(True)
+        self._archive_mode_group.addButton(self._active_threads_button)
+        self._archive_mode_group.addButton(self._archived_toggle)
+        self._active_threads_button.setChecked(not self._config.ui_state.show_archived)
         self._archived_toggle.setChecked(self._config.ui_state.show_archived)
-        self._archived_toggle.toggled.connect(self._handle_archived_toggled)
+        self._active_threads_button.clicked.connect(lambda: self._set_archived_view(False))
+        self._archived_toggle.clicked.connect(lambda: self._set_archived_view(True))
+
+        archive_mode_picker = QWidget()
+        archive_mode_picker.setObjectName("ArchiveModePicker")
+        archive_mode_layout = QHBoxLayout(archive_mode_picker)
+        archive_mode_layout.setContentsMargins(0, 0, 0, 0)
+        archive_mode_layout.setSpacing(0)
+        self._active_threads_button.setObjectName("ActiveModeButton")
+        self._archived_toggle.setObjectName("ArchivedModeButton")
+        archive_mode_layout.addWidget(self._active_threads_button)
+        archive_mode_layout.addWidget(self._archived_toggle)
+        archive_mode_picker.setStyleSheet(
+            """
+            #ArchiveModePicker QPushButton {
+                background: #2d2d2d;
+                border: 1px solid #5f5f5f;
+                color: #f0f0f0;
+                min-width: 72px;
+                padding: 5px 14px;
+            }
+            #ArchiveModePicker QPushButton:checked {
+                background: #55b7e6;
+                border-color: #55b7e6;
+                color: #101010;
+            }
+            #ArchiveModePicker QPushButton#ActiveModeButton {
+                border-bottom-left-radius: 12px;
+                border-right: 0;
+                border-top-left-radius: 12px;
+            }
+            #ArchiveModePicker QPushButton#ArchivedModeButton {
+                border-bottom-right-radius: 12px;
+                border-top-right-radius: 12px;
+            }
+            """
+        )
 
         refresh_button = QPushButton("Refresh")
         refresh_button.clicked.connect(self._refresh_threads)
 
         self._thread_status_label = QLabel("Select a workspace to load threads.")
-        self._thread_table = QTableWidget(0, 3)
-        self._thread_table.setHorizontalHeaderLabels(["Title", "Updated", "Source"])
+        self._thread_table = QTableWidget(0, 4)
+        self._thread_table.setHorizontalHeaderLabels(["Title", "Cwd", "Updated", "Source"])
         self._thread_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self._thread_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         self._thread_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -1132,6 +1275,7 @@ class MainWindow(QMainWindow):
         self._unarchive_button = QPushButton("Unarchive Selected")
         self._delete_thread_button = QPushButton("Delete Selected")
         self._delete_archived_button = QPushButton("Delete All Archived")
+        self._clean_missing_button = QPushButton("Clean Orphaned")
         self._new_thread_button.clicked.connect(self._start_new_thread)
         self._resume_button.clicked.connect(self._resume_selected_thread)
         self._fork_button.clicked.connect(self._fork_selected_thread)
@@ -1139,6 +1283,7 @@ class MainWindow(QMainWindow):
         self._unarchive_button.clicked.connect(self._unarchive_selected_thread)
         self._delete_thread_button.clicked.connect(self._delete_selected_thread)
         self._delete_archived_button.clicked.connect(self._delete_all_archived_threads)
+        self._clean_missing_button.clicked.connect(self._clean_missing_rollout_threads)
 
         self._detail_panel = QWidget()
         detail_layout = QGridLayout(self._detail_panel)
@@ -1163,8 +1308,9 @@ class MainWindow(QMainWindow):
         self._detail_panel.setVisible(False)
 
         right_top = QHBoxLayout()
-        right_top.addWidget(self._archived_toggle)
+        right_top.addWidget(archive_mode_picker)
         right_top.addStretch(1)
+        right_top.addWidget(self._clean_missing_button)
         right_top.addWidget(self._new_thread_button)
         right_top.addWidget(refresh_button)
 
@@ -1225,24 +1371,34 @@ class MainWindow(QMainWindow):
         ):
             selected_row = 0
 
+        other_item = QListWidgetItem("Other")
+        other_item.setToolTip("Show chats whose cwd is not in the configured workspace list")
+        other_item.setData(Qt.ItemDataRole.UserRole, OTHER_WORKSPACES_SELECTION)
+        self._workspace_list.addItem(other_item)
+        if (
+            self._config.ui_state.selected_workspace == OTHER_WORKSPACES_SELECTION
+            or self._config.ui_state.thread_scope == THREAD_SCOPE_OTHER_WORKSPACES
+        ):
+            selected_row = 1
+
         for index, workspace in enumerate(self._config.workspaces):
             item = QListWidgetItem(workspace.name)
             item.setToolTip(workspace.path)
             item.setData(Qt.ItemDataRole.UserRole, workspace.path)
             self._workspace_list.addItem(item)
             if (
-                self._config.ui_state.thread_scope != THREAD_SCOPE_ALL_WORKSPACES
+                self._config.ui_state.thread_scope == THREAD_SCOPE_WORKSPACE
                 and normalize_workspace_path(workspace.path) == selected_normalized
             ):
-                selected_row = index + 1
+                selected_row = index + 2
 
         self._workspace_list.setCurrentRow(selected_row)
 
     def _selected_workspace(self) -> WorkspaceEntry | None:
         current_row = self._workspace_list.currentRow()
-        if current_row <= 0:
+        if current_row <= 1:
             return None
-        workspace_index = current_row - 1
+        workspace_index = current_row - 2
         if workspace_index >= len(self._config.workspaces):
             return None
         return self._config.workspaces[workspace_index]
@@ -1250,6 +1406,10 @@ class MainWindow(QMainWindow):
     def _is_all_workspaces_selected(self) -> bool:
         current_item = self._workspace_list.currentItem()
         return current_item is not None and current_item.data(Qt.ItemDataRole.UserRole) == ALL_WORKSPACES_SELECTION
+
+    def _is_other_workspaces_selected(self) -> bool:
+        current_item = self._workspace_list.currentItem()
+        return current_item is not None and current_item.data(Qt.ItemDataRole.UserRole) == OTHER_WORKSPACES_SELECTION
 
     def _add_workspace(self) -> None:
         dialog = WorkspaceDialog(self)
@@ -1261,11 +1421,11 @@ class MainWindow(QMainWindow):
 
     def _edit_workspace(self) -> None:
         current_row = self._workspace_list.currentRow()
-        if current_row <= 0:
+        if current_row <= 1:
             QMessageBox.information(self, "Edit Workspace", "Please select a workspace first.")
             return
 
-        editing_index = current_row - 1
+        editing_index = current_row - 2
         dialog = WorkspaceDialog(self, self._config.workspaces[editing_index])
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
@@ -1276,7 +1436,7 @@ class MainWindow(QMainWindow):
     def _delete_workspace(self) -> None:
         current_row = self._workspace_list.currentRow()
         workspace = self._selected_workspace()
-        if current_row <= 0 or workspace is None:
+        if current_row <= 1 or workspace is None:
             QMessageBox.information(self, "Delete Workspace", "Please select a workspace first.")
             return
 
@@ -1288,7 +1448,7 @@ class MainWindow(QMainWindow):
         if confirmation != QMessageBox.StandardButton.Yes:
             return
 
-        del self._config.workspaces[current_row - 1]
+        del self._config.workspaces[current_row - 2]
         if not self._config.workspaces:
             self._config.ui_state.selected_workspace = ALL_WORKSPACES_SELECTION
             self._config.ui_state.thread_scope = THREAD_SCOPE_ALL_WORKSPACES
@@ -1306,10 +1466,10 @@ class MainWindow(QMainWindow):
 
         if editing_index is None:
             self._config.workspaces.append(workspace)
-            target_index = len(self._config.workspaces)
+            target_index = len(self._config.workspaces) + 1
         else:
             self._config.workspaces[editing_index] = workspace
-            target_index = editing_index + 1
+            target_index = editing_index + 2
 
         self._config.ui_state.selected_workspace = workspace.path
         self._config.ui_state.thread_scope = THREAD_SCOPE_WORKSPACE
@@ -1322,22 +1482,34 @@ class MainWindow(QMainWindow):
         if self._is_all_workspaces_selected():
             self._config.ui_state.selected_workspace = ALL_WORKSPACES_SELECTION
             self._config.ui_state.thread_scope = THREAD_SCOPE_ALL_WORKSPACES
+        elif self._is_other_workspaces_selected():
+            self._config.ui_state.selected_workspace = OTHER_WORKSPACES_SELECTION
+            self._config.ui_state.thread_scope = THREAD_SCOPE_OTHER_WORKSPACES
         else:
             self._config.ui_state.selected_workspace = workspace.path if workspace else ""
             self._config.ui_state.thread_scope = THREAD_SCOPE_WORKSPACE
         self._persist_ui_state()
         self._refresh_threads()
 
-    def _handle_archived_toggled(self, checked: bool) -> None:
-        self._config.ui_state.show_archived = checked
+    def _set_archived_view(self, archived: bool) -> None:
+        self._active_threads_button.setChecked(not archived)
+        self._archived_toggle.setChecked(archived)
+        self._config.ui_state.show_archived = archived
         self._persist_ui_state()
         self._refresh_threads()
 
     def _current_thread_scope(self) -> str:
-        return THREAD_SCOPE_ALL_WORKSPACES if self._is_all_workspaces_selected() else THREAD_SCOPE_WORKSPACE
+        if self._is_all_workspaces_selected():
+            return THREAD_SCOPE_ALL_WORKSPACES
+        if self._is_other_workspaces_selected():
+            return THREAD_SCOPE_OTHER_WORKSPACES
+        return THREAD_SCOPE_WORKSPACE
 
     def _current_thread_view(self) -> str:
         return THREAD_VIEW_CHATS
+
+    def _configured_workspace_paths(self) -> list[str]:
+        return [workspace.path for workspace in self._config.workspaces]
 
     def _refresh_threads(self) -> None:
         workspace = self._selected_workspace()
@@ -1345,6 +1517,7 @@ class MainWindow(QMainWindow):
         thread_view = self._current_thread_view()
         if workspace is None and thread_scope == THREAD_SCOPE_WORKSPACE:
             self._threads = []
+            self._missing_rollout_count = 0
             self._thread_table.setRowCount(0)
             self._thread_status_label.setText("No workspace configured.")
             self._update_action_state()
@@ -1356,9 +1529,11 @@ class MainWindow(QMainWindow):
                 self._archived_toggle.isChecked(),
                 thread_scope,
                 thread_view,
+                self._configured_workspace_paths(),
             )
         except Exception as error:  # noqa: BLE001
             self._threads = []
+            self._missing_rollout_count = 0
             self._thread_table.setRowCount(0)
             self._thread_status_label.setText("Failed to load threads.")
             self._update_action_state()
@@ -1366,25 +1541,43 @@ class MainWindow(QMainWindow):
             return
 
         self._thread_table.setRowCount(len(self._threads))
+        missing_rollout_count = 0
         for row_index, thread in enumerate(self._threads):
+            if thread.rollout_missing:
+                missing_rollout_count += 1
             values = [
                 thread.title,
+                strip_windows_verbatim_prefix(thread.cwd),
                 thread.updated_at_text,
                 thread.source,
             ]
             for column_index, value in enumerate(values):
                 item = QTableWidgetItem(value)
                 item.setToolTip(value)
+                if thread.rollout_missing:
+                    item.setToolTip(f"{value}\n\nRollout file is missing. This stale thread record is not actionable.")
+                    item.setBackground(QBrush(QColor("#303030")))
+                    item.setForeground(QBrush(QColor("#8a8a8a")))
+                    item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEnabled & ~Qt.ItemFlag.ItemIsSelectable)
                 if column_index == 0:
                     item.setData(Qt.ItemDataRole.UserRole, thread.thread_id)
                 self._thread_table.setItem(row_index, column_index, item)
 
-        scope_text = "All Workspaces" if thread_scope == THREAD_SCOPE_ALL_WORKSPACES else "Workspace"
-        workspace_text = "All" if thread_scope == THREAD_SCOPE_ALL_WORKSPACES else workspace.path if workspace else "(none)"
+        if thread_scope == THREAD_SCOPE_ALL_WORKSPACES:
+            scope_text = "All Workspaces"
+            workspace_text = "All"
+        elif thread_scope == THREAD_SCOPE_OTHER_WORKSPACES:
+            scope_text = "Other"
+            workspace_text = "Other"
+        else:
+            scope_text = "Workspace"
+            workspace_text = workspace.path if workspace else "(none)"
         archived_text = "only" if self._archived_toggle.isChecked() else "hidden"
+        self._missing_rollout_count = missing_rollout_count
+        missing_text = f" | Missing rollout: {missing_rollout_count}" if missing_rollout_count else ""
         self._thread_status_label.setText(
             f"Threads: {len(self._threads)} | Scope: {scope_text} | "
-            f"Archived: {archived_text} | Workspace: {workspace_text} | DB: {self._repository.database_path}"
+            f"Archived: {archived_text}{missing_text} | Workspace: {workspace_text} | DB: {self._repository.database_path}"
         )
         self._thread_table.resizeRowsToContents()
         self._update_action_state()
@@ -1402,12 +1595,17 @@ class MainWindow(QMainWindow):
         workspace_selected = self._selected_workspace() is not None
         thread = self._selected_thread()
         thread_selected = thread is not None
-        archived_selected = thread is not None and thread.archived
+        actionable_thread_selected = thread_selected and not thread.rollout_missing
+        archived_selected = thread is not None and thread.archived and not thread.rollout_missing
         archived_view_active = self._archived_toggle.isChecked()
-        active_thread_selected = thread_selected and not archived_selected and not archived_view_active
+        active_thread_selected = actionable_thread_selected and not thread.archived and not archived_view_active
 
         self._new_thread_button.setVisible(workspace_selected)
         self._new_thread_button.setEnabled(workspace_selected)
+
+        clean_missing_visible = self._missing_rollout_count > 0
+        self._clean_missing_button.setVisible(clean_missing_visible)
+        self._clean_missing_button.setEnabled(clean_missing_visible)
 
         self._resume_button.setVisible(active_thread_selected)
         self._resume_button.setEnabled(active_thread_selected)
@@ -1428,7 +1626,7 @@ class MainWindow(QMainWindow):
 
     def _update_detail_panel(self) -> None:
         thread = self._selected_thread()
-        if thread is None:
+        if thread is None or thread.rollout_missing:
             self._detail_panel.setVisible(False)
             self._detail_cwd.clear()
             self._detail_model.clear()
@@ -1436,7 +1634,7 @@ class MainWindow(QMainWindow):
             self._detail_first_message.clear()
             return
 
-        self._detail_cwd.setText(thread.cwd)
+        self._detail_cwd.setText(strip_windows_verbatim_prefix(thread.cwd))
         self._detail_model.setText(thread.model)
         self._detail_thread_id.setText(thread.thread_id)
         self._detail_first_message.setPlainText(thread.first_user_message)
@@ -1535,7 +1733,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 "Delete All Archived",
-                "Turn on Archived only before deleting archived threads.",
+                "Switch to Archived before deleting archived threads.",
             )
             return
         if not self._threads:
@@ -1544,7 +1742,12 @@ class MainWindow(QMainWindow):
 
         workspace = self._selected_workspace()
         thread_scope = self._current_thread_scope()
-        scope_text = "All" if thread_scope == THREAD_SCOPE_ALL_WORKSPACES else workspace.name if workspace else "Workspace"
+        if thread_scope == THREAD_SCOPE_ALL_WORKSPACES:
+            scope_text = "All"
+        elif thread_scope == THREAD_SCOPE_OTHER_WORKSPACES:
+            scope_text = "Other"
+        else:
+            scope_text = workspace.name if workspace else "Workspace"
         confirmation = QMessageBox.question(
             self,
             "Delete All Archived",
@@ -1558,6 +1761,7 @@ class MainWindow(QMainWindow):
                 workspace.path if workspace else "",
                 thread_scope,
                 self._current_thread_view(),
+                self._configured_workspace_paths(),
             )
         except Exception as error:  # noqa: BLE001
             QMessageBox.critical(self, "Delete All Archived Failed", str(error))
@@ -1570,6 +1774,47 @@ class MainWindow(QMainWindow):
         )
         self._refresh_threads()
 
+    def _clean_missing_rollout_threads(self) -> None:
+        if self._missing_rollout_count <= 0:
+            QMessageBox.information(self, "Clean Orphaned", "There are no orphaned thread records to clean.")
+            return
+
+        workspace = self._selected_workspace()
+        thread_scope = self._current_thread_scope()
+        if thread_scope == THREAD_SCOPE_ALL_WORKSPACES:
+            scope_text = "All"
+        elif thread_scope == THREAD_SCOPE_OTHER_WORKSPACES:
+            scope_text = "Other"
+        else:
+            scope_text = workspace.name if workspace else "Workspace"
+        confirmation = QMessageBox.question(
+            self,
+            "Clean Orphaned",
+            f"Clean {self._missing_rollout_count} orphaned thread records in {scope_text}?\n\n"
+            "Only SQLite index rows with missing rollout files will be removed.",
+        )
+        if confirmation != QMessageBox.StandardButton.Yes:
+            return
+
+        try:
+            deleted_count = self._repository.delete_missing_rollout_threads(
+                workspace.path if workspace else "",
+                self._archived_toggle.isChecked(),
+                thread_scope,
+                self._current_thread_view(),
+                self._configured_workspace_paths(),
+            )
+        except Exception as error:  # noqa: BLE001
+            QMessageBox.critical(self, "Clean Orphaned Failed", str(error))
+            return
+
+        QMessageBox.information(
+            self,
+            "Clean Orphaned",
+            f"Cleaned {deleted_count} orphaned thread records.",
+        )
+        self._refresh_threads()
+
     def _validated_selected_thread(self, dialog_title: str, allow_archived: bool = False) -> ThreadRecord | None:
         thread = self._selected_thread()
         if thread is None:
@@ -1577,6 +1822,13 @@ class MainWindow(QMainWindow):
             return None
         if not thread.thread_id:
             QMessageBox.warning(self, dialog_title, "The selected thread does not have a valid thread id.")
+            return None
+        if thread.rollout_missing:
+            QMessageBox.warning(
+                self,
+                dialog_title,
+                "The selected thread rollout file is missing, so this stale record cannot be used.",
+            )
             return None
         if thread.archived and not allow_archived:
             QMessageBox.warning(self, dialog_title, "Archived threads must be unarchived before this action.")
