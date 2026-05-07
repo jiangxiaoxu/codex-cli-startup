@@ -26,6 +26,14 @@ Windows 下如果你不想看到额外的空白控制台窗口,优先使用:
 
 也可以直接双击 [launcher.pyw](G:\Project\codex-cli-startup\launcher.pyw)。
 
+仓库根目录还包含已入库的 `launch_launcher.exe`,双击它会通过 `.venv\Scripts\pythonw.exe` 拉起 `launcher.py`。如果 `.venv` 不存在,它会回退到 `pythonw.exe`。这个 wrapper 依赖同目录的 `launch_launcher.dll`,`launch_launcher.deps.json`,`launch_launcher.runtimeconfig.json`。
+
+重新生成这个轻量 wrapper:
+
+```powershell
+.\.venv\Scripts\python.exe build_wrapper.py
+```
+
 ## 构建 exe
 
 如果需要无 Python 命令行的 GUI 入口,先安装打包依赖:
