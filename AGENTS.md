@@ -12,6 +12,8 @@
 - `build_wrapper.py`: 轻量 exe wrapper 构建入口
 - `codex-cli-startup.exe`: 已入库的轻量源码启动 wrapper
 - `codex-cli-startup.dll`,`codex-cli-startup.deps.json`,`codex-cli-startup.runtimeconfig.json`: wrapper 运行所需的 .NET sidecar files
+- `assets/codex-cli-startup.ico`: Windows executable icon
+- `assets/codex-cli-startup.png`: source app icon image
 - `launcher_wrapper/`: 轻量 exe wrapper 的 C# 源码
 - `build_exe.py`: PyInstaller 构建入口
 - `codex-cli-startup.spec`: PyInstaller spec
@@ -50,6 +52,7 @@ python setup_env.py --build
 ```
 
 - 运行,验证和构建命令默认使用 `.venv\Scripts\python.exe`,除非任务明确要求验证宿主 Python 行为。
+- `requirements-build.txt` 中的 `Pillow` 仅用于生成和检查 app icon assets,不属于 runtime dependency。
 - 双击源码版 GUI 时优先使用已入库的 `codex-cli-startup.exe`; 该 wrapper 会通过 `.venv\Scripts\pythonw.exe` 启动 `codex-cli-startup.py`,如果 `.venv` 不存在则回退到 `pythonw.exe`。
 - `codex-cli-startup.exe` 依赖同目录的 `codex-cli-startup.dll`,`codex-cli-startup.deps.json`,`codex-cli-startup.runtimeconfig.json`,更新 wrapper 时需要一起入库。
 - 重新生成轻量 wrapper exe 时运行:

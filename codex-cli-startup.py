@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Sequence
 
 from PySide6.QtCore import QModelIndex, QRect, Qt
-from PySide6.QtGui import QCloseEvent, QColor, QPainter
+from PySide6.QtGui import QCloseEvent, QColor, QIcon, QPainter
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
@@ -53,7 +53,20 @@ def resolve_app_dir() -> Path:
     return Path(__file__).resolve().parent
 
 
+def resolve_resource_path(relative_path: str) -> Path:
+    """Resolve a source or PyInstaller-bundled resource path.
+
+    @param relative_path: Project-relative resource path.
+    @returns: Absolute resource path.
+    """
+
+    bundle_root = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    return bundle_root / relative_path
+
+
 SCRIPT_DIR = resolve_app_dir()
+APP_ICON_PATH = resolve_resource_path("assets/codex-cli-startup.ico")
+APP_USER_MODEL_ID = "codex-cli-startup.app"
 CONFIG_FILENAME = "codex-cli-startup_config.json"
 LEGACY_CONFIG_FILENAME = "launcher_config.json"
 CONFIG_PATH = SCRIPT_DIR / CONFIG_FILENAME
@@ -71,6 +84,21 @@ THREAD_SCOPE_ALL_WORKSPACES = "all_workspaces"
 THREAD_VIEW_CHATS = "chats"
 ALL_WORKSPACES_SELECTION = "__all_workspaces__"
 INTERACTIVE_CHAT_SOURCES = {"cli", "vscode", "codex", "atlas", "chatgpt"}
+
+
+def set_windows_app_user_model_id(app_id: str) -> None:
+    """Set the Windows taskbar identity for the current process.
+
+    @param app_id: Stable Windows AppUserModelID value.
+    @returns: None.
+    """
+
+    if sys.platform != "win32":
+        return
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(app_id)
+    except (AttributeError, OSError):
+        return
 
 
 @dataclass(slots=True)
@@ -1682,8 +1710,14 @@ def main() -> int:
     @returns The process exit code.
     """
 
+    set_windows_app_user_model_id(APP_USER_MODEL_ID)
     app = QApplication(sys.argv)
+    app.setApplicationName("codex-cli-startup")
+    if APP_ICON_PATH.exists():
+        app.setWindowIcon(QIcon(str(APP_ICON_PATH)))
     window = MainWindow(CONFIG_PATH, resolve_codex_state_db_path(), resolve_codex_home_path())
+    if APP_ICON_PATH.exists():
+        window.setWindowIcon(QIcon(str(APP_ICON_PATH)))
     window.show()
     return app.exec()
 

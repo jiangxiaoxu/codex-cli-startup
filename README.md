@@ -34,6 +34,8 @@ Windows 下如果你不想看到额外的空白控制台窗口,优先使用:
 .\.venv\Scripts\python.exe build_wrapper.py
 ```
 
+wrapper 和 PyInstaller 产物使用同一个图标文件: [assets/codex-cli-startup.ico](G:\Project\codex-cli-startup\assets\codex-cli-startup.ico)。
+
 ## 构建 exe
 
 如果需要无 Python 命令行的 GUI 入口,先安装打包依赖:

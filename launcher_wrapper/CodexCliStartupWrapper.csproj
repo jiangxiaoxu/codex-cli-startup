@@ -4,6 +4,7 @@
     <TargetFramework>net10.0-windows</TargetFramework>
     <AssemblyName>codex-cli-startup</AssemblyName>
     <RootNamespace>CodexCliStartup.Wrapper</RootNamespace>
+    <ApplicationIcon>..\assets\codex-cli-startup.ico</ApplicationIcon>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
   </PropertyGroup>
