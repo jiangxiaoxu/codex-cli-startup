@@ -5,22 +5,23 @@
 ## 安装
 
 ```powershell
-python -m pip install -r requirements.txt
+python setup_env.py
 ```
 
+依赖会安装到仓库根目录的 `.venv`,不要安装到宿主 Python 环境。
 `requirements.txt` 固定为 `PySide6>=6.7,<7`。
 选择这个范围是因为它兼容当前 `Python 3.13.6`, API 已经稳定,同时避免锁到未来可能带来兼容变化的大版本。
 
 ## 启动
 
 ```powershell
-python launcher.py
+.\.venv\Scripts\python.exe launcher.py
 ```
 
 Windows 下如果你不想看到额外的空白控制台窗口,优先使用:
 
 ```powershell
-pythonw launcher.pyw
+.\.venv\Scripts\pythonw.exe launcher.pyw
 ```
 
 也可以直接双击 [launcher.pyw](G:\Project\codex-cli-startup\launcher.pyw)。
@@ -30,13 +31,13 @@ pythonw launcher.pyw
 如果需要无 Python 命令行的 GUI 入口,先安装打包依赖:
 
 ```powershell
-python -m pip install -r requirements-build.txt
+python setup_env.py --build
 ```
 
 然后执行:
 
 ```powershell
-python build_exe.py
+.\.venv\Scripts\python.exe build_exe.py
 ```
 
 生成的入口位于 [dist/CodexWorkspaceLauncher.exe](G:\Project\codex-cli-startup\dist\CodexWorkspaceLauncher.exe)。

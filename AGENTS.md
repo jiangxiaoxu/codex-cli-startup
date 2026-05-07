@@ -8,6 +8,7 @@
 
 - `launcher.py`: PySide6 主程序和 thread repository 逻辑
 - `launcher.pyw`: windowed Python 入口
+- `setup_env.py`: 项目 `.venv` 准备脚本
 - `build_exe.py`: PyInstaller 构建入口
 - `CodexWorkspaceLauncher.spec`: PyInstaller spec
 - `launcher_config.json`: 本地启动器配置
@@ -28,6 +29,23 @@
 - 注释和 docstrings 使用英文。
 - 新增或修改 public functions/methods 时,保留简洁 docstring,并包含 `@param` 和 `@returns`。
 - 避免无关 refactor 和格式化噪音。
+
+## 环境与依赖
+
+- 项目依赖必须安装到仓库根目录的 `.venv`,不要安装到宿主 Python 环境。
+- 首次准备或刷新 runtime dependencies 时运行:
+
+```powershell
+python setup_env.py
+```
+
+- 需要构建 exe 时运行:
+
+```powershell
+python setup_env.py --build
+```
+
+- 运行,验证和构建命令默认使用 `.venv\Scripts\python.exe`,除非任务明确要求验证宿主 Python 行为。
 
 ## UI 规则
 
@@ -54,7 +72,7 @@
 普通代码改动运行:
 
 ```powershell
-python -m py_compile launcher.py launcher.pyw build_exe.py
+.\.venv\Scripts\python.exe -m py_compile launcher.py launcher.pyw build_exe.py setup_env.py
 ```
 
 GUI 行为改动还需要使用:
@@ -80,8 +98,8 @@ archive/delete 改动需要包含以下 smoke coverage:
 构建 exe:
 
 ```powershell
-python -m pip install -r requirements-build.txt
-python build_exe.py
+python setup_env.py --build
+.\.venv\Scripts\python.exe build_exe.py
 ```
 
 预期输出:
