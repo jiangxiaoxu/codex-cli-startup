@@ -91,7 +91,7 @@ exe 使用 `--windowed` 模式,启动时不会显示控制台窗口。打包后�
 ## 启动行为
 
 - `Resume Selected`: 通过 `Windows Terminal` 新开独立窗口,在其中执行 `codex -C <thread cwd> resume <thread_id>`
-- `Fork Selected`: 通过 `Windows Terminal` 新开独立窗口,在其中执行 `codex -C <thread cwd> fork <thread_id>`
+- `Fork Selected`: 通过 `Windows Terminal` 新开独立窗口,在其中执行 `codex -C <thread cwd> fork <thread_id>`;如果 `logs_2.sqlite` 显示该 thread 仍有 live Codex process,会先提示确认,但允许继续
 - `Archive Selected`: 将非归档线程的 rollout 移入 `archived_sessions`,并更新 SQLite 归档状态
 - `Unarchive Selected`: 将归档线程的 rollout 从 `archived_sessions` 移回 `sessions/YYYY/MM/DD`,并更新 SQLite 归档状态
 - `Delete Selected`: 永久删除已归档线程的 rollout 和 SQLite 记录,仅对归档线程启用
@@ -101,6 +101,8 @@ exe 使用 `--windowed` 模式,启动时不会显示控制台窗口。打包后�
 - 归档线程不能直接 resume/fork,必须先 `Unarchive Selected`
 - 非归档线程不能删除,必须先 `Archive Selected`
 - 当前模式下不适用的操作按钮会直接隐藏,不会常驻显示为灰化按钮
+- 正在活动或疑似活动的线程不能归档;检测依据包括 `logs_2.sqlite` 中仍存活的 Codex process pid,以及最近 90 秒内更新过的 rollout mtime
+- `Fork Selected` 的 active 提示只使用 live Codex process pid,不使用 rollout mtime
 
 启动前会先检查:
 

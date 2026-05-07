@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import re
@@ -7,6 +8,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -57,6 +59,10 @@ DEFAULT_WINDOW_SIZE = (1280, 780)
 DEFAULT_SPLITTER_SIZES = (320, 960)
 DEFAULT_COLUMN_WIDTHS = (520, 165, 100)
 ROLLOUT_FILE_PATTERN = re.compile(r"^rollout-(\d{4})-(\d{2})-(\d{2})T.+-[0-9a-fA-F-]+\.jsonl$")
+PROCESS_UUID_PATTERN = re.compile(r"^pid:(\d+):.+$")
+CODEX_LOGS_DB_FILENAME = "logs_2.sqlite"
+ACTIVE_ROLLOUT_MTIME_GRACE_SECONDS = 90
+ACTIVE_THREAD_ARCHIVE_MESSAGE = "Thread appears active. Exit the Codex session before archiving."
 THREAD_SCOPE_WORKSPACE = "workspace"
 THREAD_SCOPE_ALL_WORKSPACES = "all_workspaces"
 THREAD_VIEW_CHATS = "chats"
@@ -172,6 +178,16 @@ def resolve_codex_home_path() -> Path:
         return Path(user_profile).expanduser() / ".codex"
 
     return Path.home() / ".codex"
+
+
+def resolve_codex_logs_db_path(codex_home_path: Path) -> Path:
+    """Resolve the Codex logs database path from a Codex home directory.
+
+    @param codex_home_path The resolved Codex home directory path.
+    @returns The resolved logs database path.
+    """
+
+    return codex_home_path / CODEX_LOGS_DB_FILENAME
 
 
 def truncate_text(text: str, limit: int) -> str:
@@ -637,6 +653,8 @@ class ThreadRepository:
                 raise RuntimeError("The selected thread is already archived.")
 
             active_path = self._resolve_active_rollout_path(str(row["rollout_path"] or ""), thread_id)
+            if self._thread_may_be_active_for_archive(thread_id, active_path):
+                raise RuntimeError(ACTIVE_THREAD_ARCHIVE_MESSAGE)
             archived_path = self._archive_active_rollout(active_path)
             archived_at = int(datetime.now().timestamp())
             connection.execute(
@@ -739,6 +757,102 @@ class ThreadRepository:
             if candidate.exists() and candidate.is_file() and self._is_path_under(candidate, sessions_root):
                 return candidate
         raise FileNotFoundError(f"Active rollout was not found for thread: {thread_id}")
+
+    def thread_has_live_process(self, thread_id: str) -> bool:
+        """Return whether Codex logs point to a still-running process for a thread.
+
+        @param thread_id The thread id to inspect in Codex logs.
+        @returns True when a logged process_uuid pid is still running.
+        """
+
+        return self._has_live_log_process(thread_id)
+
+    def _thread_may_be_active_for_archive(self, thread_id: str, rollout_path: Path) -> bool:
+        """Return whether a thread should be protected from archive.
+
+        @param thread_id The thread id to test.
+        @param rollout_path The active rollout path for the thread.
+        @returns True when the thread should be treated as active or unstable.
+        """
+
+        if self.thread_has_live_process(thread_id):
+            return True
+        return self._rollout_recently_modified(rollout_path)
+
+    def _has_live_log_process(self, thread_id: str) -> bool:
+        """Return whether recent logs point to a still-running Codex process.
+
+        @param thread_id The thread id to inspect in Codex logs.
+        @returns True when a recent process_uuid pid is still running.
+        """
+
+        logs_db_path = resolve_codex_logs_db_path(self._codex_home_path)
+        if not logs_db_path.exists():
+            return False
+
+        database_uri = f"file:{logs_db_path}?mode=ro"
+        try:
+            connection = sqlite3.connect(database_uri, uri=True)
+            try:
+                rows = connection.execute(
+                    """
+                    SELECT process_uuid
+                    FROM logs
+                    WHERE thread_id = ?
+                      AND process_uuid IS NOT NULL
+                    ORDER BY ts DESC, ts_nanos DESC, id DESC
+                    LIMIT 20
+                    """,
+                    (thread_id,),
+                ).fetchall()
+            finally:
+                connection.close()
+        except (OSError, sqlite3.Error):
+            return False
+
+        for row in rows:
+            process_uuid = str(row[0] or "")
+            match = PROCESS_UUID_PATTERN.match(process_uuid)
+            if match and self._is_pid_running(int(match.group(1))):
+                return True
+        return False
+
+    def _is_pid_running(self, pid: int) -> bool:
+        """Return whether a Windows process id is still running.
+
+        @param pid The process id to test.
+        @returns True when the process exists and has not exited.
+        """
+
+        if pid <= 0 or sys.platform != "win32":
+            return False
+
+        process_query_limited_information = 0x1000
+        still_active = 259
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(process_query_limited_information, False, pid)
+        if not handle:
+            return False
+        try:
+            exit_code = ctypes.c_ulong()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                return False
+            return exit_code.value == still_active
+        finally:
+            kernel32.CloseHandle(handle)
+
+    def _rollout_recently_modified(self, rollout_path: Path) -> bool:
+        """Return whether a rollout was recently modified.
+
+        @param rollout_path The rollout path to inspect.
+        @returns True when the rollout mtime is within the active grace period.
+        """
+
+        try:
+            modified_at = rollout_path.stat().st_mtime
+        except OSError:
+            return False
+        return time.time() - modified_at < ACTIVE_ROLLOUT_MTIME_GRACE_SECONDS
 
     def _archive_active_rollout(self, active_path: Path) -> Path:
         """Move an active rollout into the archived_sessions directory.
@@ -1309,6 +1423,15 @@ class MainWindow(QMainWindow):
         thread = self._validated_selected_thread("Fork Thread")
         if thread is None:
             return
+        if self._repository.thread_has_live_process(thread.thread_id):
+            confirmation = QMessageBox.question(
+                self,
+                "Fork Active Thread",
+                "This thread appears to be running.\n\n"
+                "Forking may capture only the currently persisted state. Continue?",
+            )
+            if confirmation != QMessageBox.StandardButton.Yes:
+                return
         self._launch_codex_fork(thread)
 
     def _archive_selected_thread(self) -> None:

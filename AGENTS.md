@@ -46,6 +46,8 @@
 - active rollout files 位于 `sessions/YYYY/MM/DD`。
 - archived rollout files 位于 `archived_sessions`。
 - 只有 archived threads 允许删除。
+- active 或疑似 active threads 不允许 archive;测试时需要覆盖 live `logs_2.sqlite` process pid 和近期 rollout mtime 两类 guard。
+- fork active warning 只允许基于 live `logs_2.sqlite` process pid,不要使用 rollout mtime。
 
 ## 验证
 
@@ -70,6 +72,8 @@ archive/delete 改动需要包含以下 smoke coverage:
 - `delete_archived_thread`
 - `delete_archived_threads` scoped to one workspace
 - `delete_archived_threads` scoped to all workspaces
+- active archive guard for live log process and recent rollout mtime
+- fork active warning uses live log process only
 
 ## 构建
 
