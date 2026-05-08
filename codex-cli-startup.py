@@ -14,9 +14,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Sequence
 
-from PySide6.QtCore import QModelIndex, QRect, Qt
-from PySide6.QtGui import QBrush, QCloseEvent, QColor, QIcon, QPainter
+from PySide6.QtCore import QModelIndex, QRect, Qt, Signal
+from PySide6.QtGui import QBrush, QCloseEvent, QColor, QDragMoveEvent, QDropEvent, QIcon, QPainter
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QButtonGroup,
     QDialog,
@@ -72,6 +73,7 @@ CONFIG_FILENAME = "codex-cli-startup_config.json"
 CONFIG_PATH = SCRIPT_DIR / CONFIG_FILENAME
 DEFAULT_WINDOW_SIZE = (1280, 780)
 DEFAULT_SPLITTER_SIZES = (320, 960)
+DEFAULT_DETAIL_SPLITTER_SIZES = (560, 170)
 DEFAULT_COLUMN_WIDTHS = (420, 260, 165, 100)
 ROLLOUT_FILE_PATTERN = re.compile(r"^rollout-(\d{4})-(\d{2})-(\d{2})T.+-[0-9a-fA-F-]+\.jsonl$")
 PROCESS_UUID_PATTERN = re.compile(r"^pid:(\d+):.+$")
@@ -84,6 +86,8 @@ THREAD_SCOPE_OTHER_WORKSPACES = "other_workspaces"
 THREAD_VIEW_CHATS = "chats"
 ALL_WORKSPACES_SELECTION = "__all_workspaces__"
 OTHER_WORKSPACES_SELECTION = "__other_workspaces__"
+FIXED_WORKSPACE_ROW_COUNT = 2
+TITLE_DISPLAY_LIMIT = 120
 INTERACTIVE_CHAT_SOURCES = {"cli", "vscode", "codex", "atlas", "chatgpt"}
 
 
@@ -117,6 +121,7 @@ class UiState:
     thread_view: str = THREAD_VIEW_CHATS
     window_size: tuple[int, int] = DEFAULT_WINDOW_SIZE
     splitter_sizes: tuple[int, int] = DEFAULT_SPLITTER_SIZES
+    detail_splitter_sizes: tuple[int, int] = DEFAULT_DETAIL_SPLITTER_SIZES
     column_widths: tuple[int, ...] = DEFAULT_COLUMN_WIDTHS
 
 
@@ -131,16 +136,32 @@ class AppConfig:
 class ThreadRecord:
     thread_id: str
     title: str
+    created_at_text: str
     updated_at_text: str
     source: str
     cwd: str
     model: str
+    model_provider: str
+    reasoning_effort: str
     rollout_path: str
     first_user_message: str
     summary: str
     archived: bool
     rollout_missing: bool
     sort_timestamp: int
+    tokens_used: int
+    cli_version: str
+    git_branch: str
+    git_sha: str
+
+
+@dataclass(slots=True)
+class ThreadUsageStats:
+    total_tokens: int | None = None
+    last_total_tokens: int | None = None
+    last_input_tokens: int | None = None
+    last_cached_input_tokens: int | None = None
+    model_context_window: int | None = None
 
 
 def normalize_workspace_path(path_text: str) -> str:
@@ -237,6 +258,23 @@ def truncate_text(text: str, limit: int) -> str:
     return f"{collapsed[: max(0, limit - 3)]}..."
 
 
+def truncate_first_line(text: str, limit: int) -> str:
+    """Return the first non-empty line truncated for table display.
+
+    @param text The source text to shorten.
+    @param limit The maximum output length.
+    @returns A single-line truncated string.
+    """
+
+    for line in text.splitlines():
+        first_line = " ".join(line.split())
+        if first_line:
+            if len(first_line) <= limit:
+                return first_line
+            return f"{first_line[: max(0, limit - 3)]}..."
+    return ""
+
+
 def format_timestamp(timestamp_value: object) -> tuple[int, str]:
     """Format a thread timestamp defensively.
 
@@ -277,6 +315,32 @@ def _coerce_int_sequence(value: object, fallback: Sequence[int]) -> tuple[int, .
     if isinstance(value, list) and all(isinstance(item, int) for item in value):
         return tuple(value)
     return tuple(fallback)
+
+
+def _coerce_optional_int(value: object) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def format_compact_number(value: int | None) -> str:
+    """Format a large integer for compact GUI display.
+
+    @param value The integer value to format.
+    @returns A compact decimal string, or N/A when missing.
+    """
+
+    if value is None:
+        return "N/A"
+    absolute_value = abs(value)
+    if absolute_value >= 1_000_000:
+        return f"{value / 1_000_000:.1f}M"
+    if absolute_value >= 1_000:
+        return f"{value / 1_000:.1f}K"
+    return str(value)
 
 
 def _is_subagent_source(raw_source: str) -> bool:
@@ -386,6 +450,101 @@ class ThreadTableDelegate(QStyledItemDelegate):
         painter.restore()
 
 
+class WorkspaceListWidget(QListWidget):
+    workspaceOrderChanged = Signal(list)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        """Create a workspace list with constrained internal drag sorting.
+
+        @param parent The optional parent widget.
+        @returns None.
+        """
+
+        super().__init__(parent)
+        self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self.setDragDropOverwriteMode(False)
+        self.setDropIndicatorShown(True)
+
+    def dropEvent(self, event: QDropEvent) -> None:
+        """Apply an internal drop only when fixed rows stay at the top.
+
+        @param event The drop event to handle.
+        @returns None.
+        """
+
+        source_rows = {index.row() for index in self.selectedIndexes()}
+        if not source_rows or any(row < FIXED_WORKSPACE_ROW_COUNT for row in source_rows):
+            event.ignore()
+            return
+
+        target_row = self._drop_target_row(event)
+        if target_row is None or target_row < FIXED_WORKSPACE_ROW_COUNT:
+            event.ignore()
+            return
+
+        previous_order = self._workspace_path_order()
+        self.blockSignals(True)
+        try:
+            super().dropEvent(event)
+        finally:
+            self.blockSignals(False)
+        current_order = self._workspace_path_order()
+        if current_order != previous_order:
+            self.workspaceOrderChanged.emit(current_order)
+
+    def dragMoveEvent(self, event: QDragMoveEvent) -> None:
+        """Accept drag moves only for valid insertion targets.
+
+        @param event The drag move event to handle.
+        @returns None.
+        """
+
+        super().dragMoveEvent(event)
+        target_row = self._drop_target_row(event)
+        if target_row is None or target_row < FIXED_WORKSPACE_ROW_COUNT:
+            event.ignore()
+
+    def _drop_target_row(self, event: QDragMoveEvent | QDropEvent) -> int | None:
+        """Return the destination row implied by the current drop indicator.
+
+        @param event The drop event to inspect.
+        @returns The target insertion row, or None when the drop is invalid.
+        """
+
+        index = self.indexAt(event.position().toPoint())
+        if not index.isValid():
+            return self.count()
+
+        row = index.row()
+        indicator_position = self.dropIndicatorPosition()
+        if indicator_position == QAbstractItemView.DropIndicatorPosition.OnItem:
+            return None
+        if indicator_position == QAbstractItemView.DropIndicatorPosition.AboveItem:
+            return row
+        if indicator_position == QAbstractItemView.DropIndicatorPosition.BelowItem:
+            return row + 1
+        if indicator_position == QAbstractItemView.DropIndicatorPosition.OnViewport:
+            return self.count()
+        return row
+
+    def _workspace_path_order(self) -> list[str]:
+        """Return current custom workspace paths in visible list order.
+
+        @param None.
+        @returns The workspace paths below the fixed rows.
+        """
+
+        ordered_paths: list[str] = []
+        for row in range(FIXED_WORKSPACE_ROW_COUNT, self.count()):
+            item = self.item(row)
+            path = item.data(Qt.ItemDataRole.UserRole) if item is not None else ""
+            if isinstance(path, str) and path:
+                ordered_paths.append(path)
+        return ordered_paths
+
+
 def load_app_config(config_path: Path) -> AppConfig:
     """Load the launcher config and create it when missing.
 
@@ -427,6 +586,10 @@ def load_app_config(config_path: Path) -> AppConfig:
         thread_view=str(raw_ui_state.get("thread_view", THREAD_VIEW_CHATS)),
         window_size=_coerce_int_sequence(raw_ui_state.get("window_size"), DEFAULT_WINDOW_SIZE)[:2],
         splitter_sizes=_coerce_int_sequence(raw_ui_state.get("splitter_sizes"), DEFAULT_SPLITTER_SIZES)[:2],
+        detail_splitter_sizes=_coerce_int_sequence(
+            raw_ui_state.get("detail_splitter_sizes"),
+            DEFAULT_DETAIL_SPLITTER_SIZES,
+        )[:2],
         column_widths=_coerce_int_sequence(raw_ui_state.get("column_widths"), DEFAULT_COLUMN_WIDTHS),
     )
     if ui_state.thread_scope not in {
@@ -441,6 +604,8 @@ def load_app_config(config_path: Path) -> AppConfig:
         ui_state.window_size = DEFAULT_WINDOW_SIZE
     if len(ui_state.splitter_sizes) != 2:
         ui_state.splitter_sizes = DEFAULT_SPLITTER_SIZES
+    if len(ui_state.detail_splitter_sizes) != 2:
+        ui_state.detail_splitter_sizes = DEFAULT_DETAIL_SPLITTER_SIZES
 
     terminal = str(raw_data.get("terminal", "wt")).strip() or "wt"
     return AppConfig(workspaces=workspaces, terminal=terminal, ui_state=ui_state)
@@ -465,6 +630,7 @@ def save_app_config(config_path: Path, config: AppConfig) -> None:
             "thread_view": config.ui_state.thread_view,
             "window_size": list(config.ui_state.window_size),
             "splitter_sizes": list(config.ui_state.splitter_sizes),
+            "detail_splitter_sizes": list(config.ui_state.detail_splitter_sizes),
             "column_widths": list(config.ui_state.column_widths),
         },
     }
@@ -566,14 +732,23 @@ class ThreadRepository:
                 '"id" AS "thread_id"' if "id" in columns else "'' AS thread_id",
                 '"rollout_path" AS "rollout_path"' if "rollout_path" in columns else "'' AS rollout_path",
                 '"title" AS "title"' if "title" in columns else "'' AS title",
+                '"created_at_ms" AS "created_at"' if "created_at_ms" in columns else (
+                    '"created_at" AS "created_at"' if "created_at" in columns else "0 AS created_at"
+                ),
                 f'"{updated_column}" AS "updated_at"' if updated_column in columns else "0 AS updated_at",
                 '"cwd" AS "cwd"' if "cwd" in columns else "'' AS cwd",
                 '"model" AS "model"' if "model" in columns else "'' AS model",
+                '"model_provider" AS "model_provider"' if "model_provider" in columns else "'' AS model_provider",
+                '"reasoning_effort" AS "reasoning_effort"' if "reasoning_effort" in columns else "'' AS reasoning_effort",
                 '"source" AS "source"' if "source" in columns else "'' AS source",
                 '"first_user_message" AS "first_user_message"'
                 if "first_user_message" in columns
                 else "'' AS first_user_message",
                 '"archived" AS "archived"' if "archived" in columns else "0 AS archived",
+                '"tokens_used" AS "tokens_used"' if "tokens_used" in columns else "0 AS tokens_used",
+                '"cli_version" AS "cli_version"' if "cli_version" in columns else "'' AS cli_version",
+                '"git_branch" AS "git_branch"' if "git_branch" in columns else "'' AS git_branch",
+                '"git_sha" AS "git_sha"' if "git_sha" in columns else "'' AS git_sha",
             ]
 
             rows = connection.execute(
@@ -606,7 +781,8 @@ class ThreadRepository:
                 continue
 
             sort_timestamp, updated_text = format_timestamp(row["updated_at"])
-            title = str(row["title"] or "").strip()
+            _created_sort_timestamp, created_text = format_timestamp(row["created_at"])
+            title = truncate_first_line(str(row["title"] or "").strip(), TITLE_DISPLAY_LIMIT)
             first_user_message = str(row["first_user_message"] or "").strip()
             summary = truncate_text(first_user_message, 160)
             if thread_view == THREAD_VIEW_CHATS and not title and not summary:
@@ -617,21 +793,93 @@ class ThreadRepository:
                 ThreadRecord(
                     thread_id=thread_id,
                     title=display_title,
+                    created_at_text=created_text,
                     updated_at_text=updated_text,
                     source=_display_source(source),
                     cwd=cwd,
                     model=str(row["model"] or ""),
+                    model_provider=str(row["model_provider"] or ""),
+                    reasoning_effort=str(row["reasoning_effort"] or ""),
                     rollout_path=str(row["rollout_path"] or ""),
                     first_user_message=first_user_message,
                     summary=summary,
                     archived=archived_flag,
                     rollout_missing=self._rollout_missing(str(row["rollout_path"] or ""), thread_id, archived_flag),
                     sort_timestamp=sort_timestamp,
+                    tokens_used=_coerce_optional_int(row["tokens_used"]) or 0,
+                    cli_version=str(row["cli_version"] or ""),
+                    git_branch=str(row["git_branch"] or ""),
+                    git_sha=str(row["git_sha"] or ""),
                 )
             )
 
         records.sort(key=lambda item: (item.sort_timestamp, item.thread_id), reverse=True)
         return records
+
+    def load_thread_usage_stats(self, thread: ThreadRecord) -> ThreadUsageStats:
+        """Load token and activity stats from a thread rollout file.
+
+        @param thread The thread record whose rollout should be inspected.
+        @returns Parsed usage stats with missing values left as None.
+        """
+
+        stats = ThreadUsageStats()
+        if thread.rollout_missing:
+            return stats
+
+        try:
+            rollout_path = (
+                self._resolve_archived_rollout_path(thread.rollout_path, thread.thread_id)
+                if thread.archived
+                else self._resolve_active_rollout_path(thread.rollout_path, thread.thread_id)
+            )
+        except FileNotFoundError:
+            return stats
+
+        try:
+            with rollout_path.open("r", encoding="utf-8", errors="replace") as rollout_file:
+                for line in rollout_file:
+                    if not line.strip():
+                        continue
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(event, dict):
+                        continue
+
+                    payload = event.get("payload")
+                    if not isinstance(payload, dict):
+                        continue
+                    payload_type = str(payload.get("type") or "")
+
+                    if event.get("type") == "event_msg" and payload_type == "token_count":
+                        self._apply_token_count_payload(stats, payload)
+        except OSError:
+            return stats
+
+        return stats
+
+    def _apply_token_count_payload(self, stats: ThreadUsageStats, payload: dict[str, object]) -> None:
+        info = payload.get("info")
+        if not isinstance(info, dict):
+            return
+
+        total_token_usage = info.get("total_token_usage")
+        if isinstance(total_token_usage, dict):
+            total_tokens = _coerce_optional_int(total_token_usage.get("total_tokens"))
+            if total_tokens is not None:
+                stats.total_tokens = total_tokens
+
+        last_token_usage = info.get("last_token_usage")
+        if isinstance(last_token_usage, dict):
+            stats.last_total_tokens = _coerce_optional_int(last_token_usage.get("total_tokens"))
+            stats.last_input_tokens = _coerce_optional_int(last_token_usage.get("input_tokens"))
+            stats.last_cached_input_tokens = _coerce_optional_int(last_token_usage.get("cached_input_tokens"))
+
+        context_window = _coerce_optional_int(info.get("model_context_window"))
+        if context_window is not None:
+            stats.model_context_window = context_window
 
     def unarchive_thread(self, thread_id: str) -> Path:
         """Move an archived thread rollout back to sessions and update SQLite.
@@ -1152,13 +1400,15 @@ class MainWindow(QMainWindow):
         self._config = load_app_config(config_path)
         self._repository = ThreadRepository(state_db_path, codex_home_path)
         self._threads: list[ThreadRecord] = []
+        self._thread_stats_cache: dict[str, ThreadUsageStats] = {}
         self._missing_rollout_count = 0
 
         self.setWindowTitle("codex-cli-startup")
         self.resize(*self._config.ui_state.window_size)
 
-        self._workspace_list = QListWidget()
+        self._workspace_list = WorkspaceListWidget()
         self._workspace_list.currentRowChanged.connect(self._handle_workspace_changed)
+        self._workspace_list.workspaceOrderChanged.connect(self._handle_workspace_reordered)
 
         add_button = QPushButton("Add")
         edit_button = QPushButton("Edit")
@@ -1292,20 +1542,38 @@ class MainWindow(QMainWindow):
         self._detail_cwd = QLineEdit()
         self._detail_model = QLineEdit()
         self._detail_thread_id = QLineEdit()
-        for line_edit in (self._detail_cwd, self._detail_model, self._detail_thread_id):
+        self._detail_usage = QLineEdit()
+        self._detail_time = QLineEdit()
+        for line_edit in (
+            self._detail_cwd,
+            self._detail_model,
+            self._detail_thread_id,
+            self._detail_usage,
+            self._detail_time,
+        ):
             line_edit.setReadOnly(True)
         self._detail_first_message = QPlainTextEdit()
         self._detail_first_message.setReadOnly(True)
-        self._detail_first_message.setMaximumHeight(90)
+        self._detail_first_message.setMinimumHeight(80)
         detail_layout.addWidget(QLabel("Cwd"), 1, 0)
         detail_layout.addWidget(self._detail_cwd, 1, 1)
         detail_layout.addWidget(QLabel("Model"), 2, 0)
         detail_layout.addWidget(self._detail_model, 2, 1)
         detail_layout.addWidget(QLabel("Thread ID"), 3, 0)
         detail_layout.addWidget(self._detail_thread_id, 3, 1)
-        detail_layout.addWidget(QLabel("First User Message"), 4, 0)
-        detail_layout.addWidget(self._detail_first_message, 4, 1)
+        detail_layout.addWidget(QLabel("Usage"), 4, 0)
+        detail_layout.addWidget(self._detail_usage, 4, 1)
+        detail_layout.addWidget(QLabel("Time"), 5, 0)
+        detail_layout.addWidget(self._detail_time, 5, 1)
+        detail_layout.addWidget(QLabel("First User Message"), 6, 0)
+        detail_layout.addWidget(self._detail_first_message, 6, 1)
         self._detail_panel.setVisible(False)
+
+        self._thread_detail_splitter = QSplitter(Qt.Orientation.Vertical)
+        self._thread_detail_splitter.addWidget(self._thread_table)
+        self._thread_detail_splitter.addWidget(self._detail_panel)
+        self._thread_detail_splitter.setCollapsible(0, False)
+        self._thread_detail_splitter.setCollapsible(1, False)
 
         right_top = QHBoxLayout()
         right_top.addWidget(archive_mode_picker)
@@ -1327,8 +1595,7 @@ class MainWindow(QMainWindow):
         right_layout = QVBoxLayout(right_panel)
         right_layout.addLayout(right_top)
         right_layout.addWidget(self._thread_status_label)
-        right_layout.addWidget(self._thread_table, 1)
-        right_layout.addWidget(self._detail_panel)
+        right_layout.addWidget(self._thread_detail_splitter, 1)
         right_layout.addLayout(right_buttons)
 
         self._splitter = QSplitter()
@@ -1344,6 +1611,7 @@ class MainWindow(QMainWindow):
 
         self._populate_workspace_list()
         self._splitter.setSizes(list(self._config.ui_state.splitter_sizes))
+        self._thread_detail_splitter.setSizes(list(self._config.ui_state.detail_splitter_sizes))
         self._update_action_state()
 
     def closeEvent(self, event: QCloseEvent) -> None:
@@ -1364,6 +1632,7 @@ class MainWindow(QMainWindow):
         all_item = QListWidgetItem("All")
         all_item.setToolTip("Show chats from all workspaces")
         all_item.setData(Qt.ItemDataRole.UserRole, ALL_WORKSPACES_SELECTION)
+        all_item.setFlags(all_item.flags() & ~Qt.ItemFlag.ItemIsDragEnabled & ~Qt.ItemFlag.ItemIsDropEnabled)
         self._workspace_list.addItem(all_item)
         if (
             self._config.ui_state.selected_workspace == ALL_WORKSPACES_SELECTION
@@ -1374,6 +1643,7 @@ class MainWindow(QMainWindow):
         other_item = QListWidgetItem("Other")
         other_item.setToolTip("Show chats whose cwd is not in the configured workspace list")
         other_item.setData(Qt.ItemDataRole.UserRole, OTHER_WORKSPACES_SELECTION)
+        other_item.setFlags(other_item.flags() & ~Qt.ItemFlag.ItemIsDragEnabled & ~Qt.ItemFlag.ItemIsDropEnabled)
         self._workspace_list.addItem(other_item)
         if (
             self._config.ui_state.selected_workspace == OTHER_WORKSPACES_SELECTION
@@ -1385,6 +1655,7 @@ class MainWindow(QMainWindow):
             item = QListWidgetItem(workspace.name)
             item.setToolTip(workspace.path)
             item.setData(Qt.ItemDataRole.UserRole, workspace.path)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsDragEnabled | Qt.ItemFlag.ItemIsDropEnabled)
             self._workspace_list.addItem(item)
             if (
                 self._config.ui_state.thread_scope == THREAD_SCOPE_WORKSPACE
@@ -1491,6 +1762,33 @@ class MainWindow(QMainWindow):
         self._persist_ui_state()
         self._refresh_threads()
 
+    def _handle_workspace_reordered(self, ordered_paths: list[str]) -> None:
+        remaining_workspaces = list(self._config.workspaces)
+        reordered_workspaces: list[WorkspaceEntry] = []
+
+        for path in ordered_paths:
+            normalized_path = normalize_workspace_path(path)
+            matching_index = next(
+                (
+                    index
+                    for index, workspace in enumerate(remaining_workspaces)
+                    if normalize_workspace_path(workspace.path) == normalized_path
+                ),
+                None,
+            )
+            if matching_index is None:
+                continue
+            reordered_workspaces.append(remaining_workspaces.pop(matching_index))
+
+        if remaining_workspaces:
+            reordered_workspaces.extend(remaining_workspaces)
+        if not reordered_workspaces:
+            return
+
+        self._config.workspaces = reordered_workspaces
+        self._persist_ui_state()
+        self._update_action_state()
+
     def _set_archived_view(self, archived: bool) -> None:
         self._active_threads_button.setChecked(not archived)
         self._archived_toggle.setChecked(archived)
@@ -1515,6 +1813,7 @@ class MainWindow(QMainWindow):
         workspace = self._selected_workspace()
         thread_scope = self._current_thread_scope()
         thread_view = self._current_thread_view()
+        self._thread_stats_cache.clear()
         if workspace is None and thread_scope == THREAD_SCOPE_WORKSPACE:
             self._threads = []
             self._missing_rollout_count = 0
@@ -1631,14 +1930,53 @@ class MainWindow(QMainWindow):
             self._detail_cwd.clear()
             self._detail_model.clear()
             self._detail_thread_id.clear()
+            self._detail_usage.clear()
+            self._detail_time.clear()
             self._detail_first_message.clear()
             return
 
+        usage_stats = self._thread_stats_cache.get(thread.thread_id)
+        if usage_stats is None:
+            usage_stats = self._repository.load_thread_usage_stats(thread)
+            self._thread_stats_cache[thread.thread_id] = usage_stats
+
         self._detail_cwd.setText(strip_windows_verbatim_prefix(thread.cwd))
-        self._detail_model.setText(thread.model)
+        self._detail_model.setText(self._format_model_detail(thread))
         self._detail_thread_id.setText(thread.thread_id)
+        self._detail_usage.setText(self._format_usage_detail(usage_stats))
+        self._detail_time.setText(self._format_time_detail(thread))
         self._detail_first_message.setPlainText(thread.first_user_message)
         self._detail_panel.setVisible(True)
+
+    def _format_model_detail(self, thread: ThreadRecord) -> str:
+        model_parts = [thread.model or "N/A"]
+        if thread.reasoning_effort:
+            model_parts.append(f"effort: {thread.reasoning_effort}")
+        if thread.model_provider:
+            model_parts.append(f"provider: {thread.model_provider}")
+        return " | ".join(model_parts)
+
+    def _format_usage_detail(self, usage_stats: ThreadUsageStats) -> str:
+        if usage_stats.total_tokens is None and usage_stats.last_total_tokens is None:
+            return "N/A"
+
+        context_text = "Context N/A"
+        if usage_stats.last_input_tokens is not None and usage_stats.model_context_window:
+            context_percent = usage_stats.last_input_tokens / usage_stats.model_context_window * 100
+            context_text = (
+                f"Context {context_percent:.1f}% of {format_compact_number(usage_stats.model_context_window)}"
+            )
+
+        return (
+            f"Total {format_compact_number(usage_stats.total_tokens)} | "
+            f"Last {format_compact_number(usage_stats.last_total_tokens)} | "
+            f"{context_text} | Cached {format_compact_number(usage_stats.last_cached_input_tokens)}"
+        )
+
+    def _format_time_detail(self, thread: ThreadRecord) -> str:
+        created_text = thread.created_at_text or "N/A"
+        updated_text = thread.updated_at_text or "N/A"
+        return f"Created {created_text} | Updated {updated_text}"
 
     def _resume_selected_thread(self) -> None:
         thread = self._validated_selected_thread("Resume Thread")
@@ -1939,6 +2277,9 @@ class MainWindow(QMainWindow):
         self._config.ui_state.thread_scope = self._current_thread_scope()
         self._config.ui_state.thread_view = self._current_thread_view()
         self._config.ui_state.splitter_sizes = tuple(self._splitter.sizes()[:2])
+        detail_splitter_sizes = tuple(self._thread_detail_splitter.sizes()[:2])
+        if self._detail_panel.isVisible() and len(detail_splitter_sizes) == 2 and detail_splitter_sizes[1] > 0:
+            self._config.ui_state.detail_splitter_sizes = detail_splitter_sizes
         self._config.ui_state.column_widths = tuple(
             self._thread_table.columnWidth(index) for index in range(self._thread_table.columnCount())
         )
