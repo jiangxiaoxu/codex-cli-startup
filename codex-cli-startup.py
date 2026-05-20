@@ -75,11 +75,19 @@ DEFAULT_WINDOW_SIZE = (1280, 780)
 DEFAULT_SPLITTER_SIZES = (320, 960)
 DEFAULT_DETAIL_SPLITTER_SIZES = (560, 170)
 DEFAULT_COLUMN_WIDTHS = (420, 260, 165, 100)
-ROLLOUT_FILE_PATTERN = re.compile(r"^rollout-(\d{4})-(\d{2})-(\d{2})T.+-[0-9a-fA-F-]+\.jsonl$")
+ROLLOUT_FILE_PATTERN = re.compile(
+    r"^rollout-(\d{4})-(\d{2})-(\d{2})T.+-"
+    r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\.jsonl$"
+)
 PROCESS_UUID_PATTERN = re.compile(r"^pid:(\d+):.+$")
 CODEX_LOGS_DB_FILENAME = "logs_2.sqlite"
 ACTIVE_ROLLOUT_MTIME_GRACE_SECONDS = 90
 ACTIVE_THREAD_ARCHIVE_MESSAGE = "Thread appears active. Exit the Codex session before archiving."
+ACTIVE_THREAD_UNKNOWN_MESSAGE = "Thread activity could not be confirmed. Refresh Codex logs before archiving."
+LIVE_PROCESS_STATE_LIVE = "live"
+LIVE_PROCESS_STATE_NOT_LIVE = "not_live"
+LIVE_PROCESS_STATE_UNKNOWN = "unknown"
+THREAD_WRITE_REQUIRED_COLUMNS = {"id", "rollout_path", "archived", "archived_at", "updated_at"}
 THREAD_SCOPE_WORKSPACE = "workspace"
 THREAD_SCOPE_ALL_WORKSPACES = "all_workspaces"
 THREAD_SCOPE_OTHER_WORKSPACES = "other_workspaces"
@@ -290,11 +298,12 @@ def format_timestamp(timestamp_value: object) -> tuple[int, str]:
     except (TypeError, ValueError):
         return 0, str(timestamp_value)
 
-    if raw_timestamp > 10_000_000_000:
-        raw_timestamp = raw_timestamp // 1000
+    display_timestamp = raw_timestamp
+    if display_timestamp > 10_000_000_000:
+        display_timestamp = display_timestamp // 1000
 
     try:
-        display_text = datetime.fromtimestamp(raw_timestamp).strftime("%Y-%m-%d %H:%M:%S")
+        display_text = datetime.fromtimestamp(display_timestamp).strftime("%Y-%m-%d %H:%M:%S")
     except (OverflowError, OSError, ValueError):
         display_text = str(raw_timestamp)
     return raw_timestamp, display_text
@@ -669,6 +678,50 @@ class ThreadRepository:
 
         return self._codex_home_path
 
+    def _connect_state_db(self, read_only: bool) -> sqlite3.Connection:
+        """Open the Codex state database with consistent connection settings.
+
+        @param read_only Whether to open the database in read-only mode.
+        @returns A configured SQLite connection.
+        """
+
+        if not self._database_path.exists():
+            raise FileNotFoundError(f"Codex state database was not found: {self._database_path}")
+
+        database_uri = f"file:{self._database_path}?mode=ro" if read_only else f"file:{self._database_path}"
+        connection = sqlite3.connect(database_uri, uri=True)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA busy_timeout = 5000")
+        return connection
+
+    def _table_columns(self, connection: sqlite3.Connection, table_name: str) -> set[str]:
+        """Return the column names for a SQLite table.
+
+        @param connection The SQLite connection to inspect.
+        @param table_name The table whose columns should be returned.
+        @returns A set of column names, or an empty set when the table is absent.
+        """
+
+        return {
+            str(row["name"])
+            for row in connection.execute(f"PRAGMA table_info({table_name})").fetchall()
+            if "name" in row.keys()
+        }
+
+    def _require_thread_write_schema(self, connection: sqlite3.Connection) -> set[str]:
+        """Validate that the threads table supports archive/delete writes.
+
+        @param connection The SQLite connection to inspect.
+        @returns The threads table columns.
+        """
+
+        columns = self._table_columns(connection, "threads")
+        missing_columns = sorted(THREAD_WRITE_REQUIRED_COLUMNS - columns)
+        if missing_columns:
+            missing_text = ", ".join(missing_columns)
+            raise RuntimeError(f"Codex threads table is missing required columns: {missing_text}")
+        return columns
+
     def load_threads(
         self,
         workspace_path: str,
@@ -687,9 +740,6 @@ class ThreadRepository:
         @returns A list of threads sorted by most recent update.
         """
 
-        if not self._database_path.exists():
-            raise FileNotFoundError(f"Codex state database was not found: {self._database_path}")
-
         if thread_scope not in {
             THREAD_SCOPE_WORKSPACE,
             THREAD_SCOPE_ALL_WORKSPACES,
@@ -702,25 +752,17 @@ class ThreadRepository:
         normalized_known_workspaces = {
             normalize_workspace_path(path_text) for path_text in known_workspace_paths if path_text.strip()
         }
-        database_uri = f"file:{self._database_path}?mode=ro"
-        connection = sqlite3.connect(database_uri, uri=True)
-        connection.row_factory = sqlite3.Row
+        connection = self._connect_state_db(True)
 
         try:
-            columns = {
-                str(row["name"])
-                for row in connection.execute("PRAGMA table_info(threads)").fetchall()
-                if "name" in row.keys()
-            }
+            columns = self._table_columns(connection, "threads")
             if not columns:
                 raise RuntimeError("The threads table is missing or could not be introspected.")
 
-            updated_column = "updated_at" if "updated_at" in columns else "created_at"
-            edge_columns = {
-                str(row["name"])
-                for row in connection.execute("PRAGMA table_info(thread_spawn_edges)").fetchall()
-                if "name" in row.keys()
-            }
+            updated_column = "updated_at_ms" if "updated_at_ms" in columns else (
+                "updated_at" if "updated_at" in columns else "created_at"
+            )
+            edge_columns = self._table_columns(connection, "thread_spawn_edges")
             child_thread_ids: set[str] = set()
             if "child_thread_id" in edge_columns:
                 child_thread_ids = {
@@ -888,13 +930,12 @@ class ThreadRepository:
         @returns The restored rollout path.
         """
 
-        if not self._database_path.exists():
-            raise FileNotFoundError(f"Codex state database was not found: {self._database_path}")
-
-        database_uri = f"file:{self._database_path}"
-        connection = sqlite3.connect(database_uri, uri=True)
-        connection.row_factory = sqlite3.Row
+        connection = self._connect_state_db(False)
+        restored_path: Path | None = None
+        archived_path: Path | None = None
         try:
+            columns = self._require_thread_write_schema(connection)
+            connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
                 "SELECT id, rollout_path, archived FROM threads WHERE id = ?",
                 (thread_id,),
@@ -906,22 +947,13 @@ class ThreadRepository:
 
             archived_path = self._resolve_archived_rollout_path(str(row["rollout_path"] or ""), thread_id)
             restored_path = self._restore_archived_rollout(archived_path)
-            restored_path_text = str(restored_path)
-            connection.execute(
-                """
-                UPDATE threads
-                SET archived = 0,
-                    archived_at = NULL,
-                    rollout_path = ?,
-                    updated_at = ?
-                WHERE id = ?
-                """,
-                (restored_path_text, int(restored_path.stat().st_mtime), thread_id),
-            )
+            self._update_thread_archive_state(connection, columns, thread_id, restored_path, False, None)
             connection.commit()
             return restored_path
         except Exception:
             connection.rollback()
+            if restored_path is not None and archived_path is not None:
+                self._move_rollout_back(restored_path, archived_path)
             raise
         finally:
             connection.close()
@@ -933,13 +965,12 @@ class ThreadRepository:
         @returns The archived rollout path.
         """
 
-        if not self._database_path.exists():
-            raise FileNotFoundError(f"Codex state database was not found: {self._database_path}")
-
-        database_uri = f"file:{self._database_path}"
-        connection = sqlite3.connect(database_uri, uri=True)
-        connection.row_factory = sqlite3.Row
+        connection = self._connect_state_db(False)
+        active_path: Path | None = None
+        archived_path: Path | None = None
         try:
+            columns = self._require_thread_write_schema(connection)
+            connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
                 "SELECT id, rollout_path, archived FROM threads WHERE id = ?",
                 (thread_id,),
@@ -950,25 +981,16 @@ class ThreadRepository:
                 raise RuntimeError("The selected thread is already archived.")
 
             active_path = self._resolve_active_rollout_path(str(row["rollout_path"] or ""), thread_id)
-            if self._thread_may_be_active_for_archive(thread_id, active_path):
-                raise RuntimeError(ACTIVE_THREAD_ARCHIVE_MESSAGE)
+            self._assert_thread_can_archive(thread_id, active_path)
             archived_path = self._archive_active_rollout(active_path)
             archived_at = int(datetime.now().timestamp())
-            connection.execute(
-                """
-                UPDATE threads
-                SET archived = 1,
-                    archived_at = ?,
-                    rollout_path = ?,
-                    updated_at = ?
-                WHERE id = ?
-                """,
-                (archived_at, str(archived_path), int(archived_path.stat().st_mtime), thread_id),
-            )
+            self._update_thread_archive_state(connection, columns, thread_id, archived_path, True, archived_at)
             connection.commit()
             return archived_path
         except Exception:
             connection.rollback()
+            if archived_path is not None and active_path is not None:
+                self._move_rollout_back(archived_path, active_path)
             raise
         finally:
             connection.close()
@@ -980,13 +1002,13 @@ class ThreadRepository:
         @returns None.
         """
 
-        if not self._database_path.exists():
-            raise FileNotFoundError(f"Codex state database was not found: {self._database_path}")
-
-        database_uri = f"file:{self._database_path}"
-        connection = sqlite3.connect(database_uri, uri=True)
-        connection.row_factory = sqlite3.Row
+        connection = self._connect_state_db(False)
+        archived_path: Path | None = None
+        staged_path: Path | None = None
+        committed = False
         try:
+            self._require_thread_write_schema(connection)
+            connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
                 "SELECT id, rollout_path, archived FROM threads WHERE id = ?",
                 (thread_id,),
@@ -1001,7 +1023,7 @@ class ThreadRepository:
             except FileNotFoundError:
                 archived_path = None
             if archived_path is not None:
-                archived_path.unlink()
+                staged_path = self._stage_rollout_for_delete(archived_path)
             connection.execute("DELETE FROM threads WHERE id = ?", (thread_id,))
             if self._table_exists(connection, "thread_spawn_edges"):
                 connection.execute(
@@ -1012,11 +1034,94 @@ class ThreadRepository:
                     (thread_id, thread_id),
                 )
             connection.commit()
+            committed = True
+            if staged_path is not None:
+                try:
+                    staged_path.unlink()
+                except OSError:
+                    pass
         except Exception:
-            connection.rollback()
+            if not committed:
+                connection.rollback()
+            if not committed and staged_path is not None and archived_path is not None:
+                self._move_rollout_back(staged_path, archived_path)
             raise
         finally:
             connection.close()
+
+    def _update_thread_archive_state(
+        self,
+        connection: sqlite3.Connection,
+        columns: set[str],
+        thread_id: str,
+        rollout_path: Path,
+        archived: bool,
+        archived_at: int | None,
+    ) -> None:
+        """Update SQLite archive metadata after a rollout move.
+
+        @param connection The SQLite connection to update.
+        @param columns The introspected threads table columns.
+        @param thread_id The thread id to update.
+        @param rollout_path The new absolute rollout path.
+        @param archived Whether the thread is archived.
+        @param archived_at The archive timestamp, or None for active threads.
+        @returns None.
+        """
+
+        modified_at = rollout_path.stat().st_mtime
+        assignments = [
+            "archived = ?",
+            "archived_at = ?",
+            "rollout_path = ?",
+            "updated_at = ?",
+        ]
+        values: list[object] = [
+            1 if archived else 0,
+            archived_at,
+            str(rollout_path),
+            int(modified_at),
+        ]
+        if "updated_at_ms" in columns:
+            assignments.append("updated_at_ms = ?")
+            values.append(int(modified_at * 1000))
+        values.append(thread_id)
+        connection.execute(
+            f"""
+            UPDATE threads
+            SET {", ".join(assignments)}
+            WHERE id = ?
+            """,
+            values,
+        )
+
+    def _stage_rollout_for_delete(self, archived_path: Path) -> Path:
+        """Move an archived rollout to a local trash staging path.
+
+        @param archived_path The archived rollout path to stage for deletion.
+        @returns The staged rollout path.
+        """
+
+        trash_root = self._codex_home_path / ".codex-cli-startup-trash"
+        trash_root.mkdir(parents=True, exist_ok=True)
+        staged_path = trash_root / f"{int(time.time() * 1000)}-{os.getpid()}-{archived_path.name}"
+        shutil.move(str(archived_path), str(staged_path))
+        return staged_path
+
+    def _move_rollout_back(self, source_path: Path, destination_path: Path) -> None:
+        """Best-effort rollback for a file move.
+
+        @param source_path The current rollout path.
+        @param destination_path The original rollout path.
+        @returns None.
+        """
+
+        try:
+            if source_path.exists() and not destination_path.exists():
+                destination_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(source_path), str(destination_path))
+        except OSError:
+            pass
 
     def delete_archived_threads(
         self,
@@ -1079,16 +1184,10 @@ class ThreadRepository:
         """
 
         sessions_root = self._codex_home_path / "sessions"
-        if rollout_path_text:
-            stored_path = Path(rollout_path_text)
-            candidate = stored_path if stored_path.is_absolute() else self._codex_home_path / stored_path
-            if candidate.exists() and candidate.is_file() and self._is_path_under(candidate, sessions_root):
-                return candidate
-        if sessions_root.exists():
-            for candidate in sessions_root.rglob(f"*{thread_id}*.jsonl"):
-                if candidate.exists() and candidate.is_file() and self._is_path_under(candidate, sessions_root):
-                    return candidate
-        raise FileNotFoundError(f"Active rollout was not found for thread: {thread_id}")
+        stored_candidate = self._stored_rollout_candidate(rollout_path_text, sessions_root, archived=False)
+        if stored_candidate is not None and self._rollout_matches_thread(stored_candidate, thread_id, archived=False):
+            return stored_candidate
+        return self._find_rollout_by_thread_id(sessions_root, thread_id, archived=False)
 
     def _rollout_missing(self, rollout_path_text: str, thread_id: str, archived: bool) -> bool:
         """Return whether a thread index row has no matching rollout file.
@@ -1108,6 +1207,112 @@ class ThreadRepository:
             return True
         return False
 
+    def _stored_rollout_candidate(self, rollout_path_text: str, root: Path, archived: bool) -> Path | None:
+        """Resolve a stored SQLite rollout path within the expected root.
+
+        @param rollout_path_text The rollout path stored in SQLite.
+        @param root The expected rollout root directory.
+        @param archived Whether the candidate should be an archived rollout.
+        @returns A candidate path, or None when the stored path is unusable.
+        """
+
+        if not rollout_path_text:
+            return None
+        stored_path = Path(rollout_path_text)
+        candidate = stored_path if stored_path.is_absolute() else self._codex_home_path / stored_path
+        if not candidate.exists() or not candidate.is_file():
+            return None
+        if archived:
+            if not self._is_direct_child(candidate, root):
+                return None
+        elif not self._is_active_rollout_location(candidate, root):
+            return None
+        return candidate
+
+    def _find_rollout_by_thread_id(self, root: Path, thread_id: str, archived: bool) -> Path:
+        """Find a rollout by exact thread id and session metadata.
+
+        @param root The active or archived rollout root.
+        @param thread_id The thread id to locate.
+        @param archived Whether the root is the archived rollout root.
+        @returns The single matching rollout path.
+        """
+
+        if not root.exists():
+            location = "archived" if archived else "active"
+            raise FileNotFoundError(f"{location.title()} rollout was not found for thread: {thread_id}")
+
+        iterator = root.glob("*.jsonl") if archived else root.rglob("*.jsonl")
+        matches = [
+            candidate
+            for candidate in iterator
+            if self._rollout_matches_thread(candidate, thread_id, archived)
+        ]
+        if len(matches) > 1:
+            match_text = "\n".join(str(path) for path in matches)
+            raise RuntimeError(f"Multiple rollout files match thread {thread_id}:\n{match_text}")
+        if matches:
+            return matches[0]
+
+        location = "Archived" if archived else "Active"
+        raise FileNotFoundError(f"{location} rollout was not found for thread: {thread_id}")
+
+    def _rollout_matches_thread(self, candidate: Path, thread_id: str, archived: bool) -> bool:
+        """Return whether a rollout file exactly belongs to a thread.
+
+        @param candidate The rollout path to inspect.
+        @param thread_id The expected thread id.
+        @param archived Whether the rollout should be archived.
+        @returns True when filename, location, and session metadata match.
+        """
+
+        root = self._codex_home_path / ("archived_sessions" if archived else "sessions")
+        if not candidate.exists() or not candidate.is_file():
+            return False
+        if archived:
+            if not self._is_direct_child(candidate, root):
+                return False
+        elif not self._is_active_rollout_location(candidate, root):
+            return False
+        if not self._rollout_filename_matches_thread(candidate.name, thread_id):
+            return False
+        return self._rollout_session_meta_matches_thread(candidate, thread_id)
+
+    def _rollout_filename_matches_thread(self, file_name: str, thread_id: str) -> bool:
+        """Return whether a rollout filename has the expected thread id suffix.
+
+        @param file_name The rollout filename to inspect.
+        @param thread_id The expected thread id.
+        @returns True when the filename matches the Codex rollout pattern and id.
+        """
+
+        match = ROLLOUT_FILE_PATTERN.match(file_name)
+        return bool(match and match.group(4).lower() == thread_id.lower())
+
+    def _rollout_session_meta_matches_thread(self, rollout_path: Path, thread_id: str) -> bool:
+        """Return whether the rollout head contains matching session metadata.
+
+        @param rollout_path The rollout file to inspect.
+        @param thread_id The expected thread id.
+        @returns True when the first JSONL item is session metadata for the thread.
+        """
+
+        try:
+            with rollout_path.open("r", encoding="utf-8", errors="replace") as rollout_file:
+                first_line = rollout_file.readline()
+        except OSError:
+            return False
+        if not first_line:
+            return False
+        try:
+            item = json.loads(first_line)
+        except json.JSONDecodeError:
+            return False
+        if not isinstance(item, dict) or item.get("type") != "session_meta":
+            return False
+        payload = item.get("payload")
+        return isinstance(payload, dict) and str(payload.get("id") or "").lower() == thread_id.lower()
+
     def thread_has_live_process(self, thread_id: str) -> bool:
         """Return whether Codex logs point to a still-running process for a thread.
 
@@ -1115,7 +1320,7 @@ class ThreadRepository:
         @returns True when a logged process_uuid pid is still running.
         """
 
-        return self._has_live_log_process(thread_id)
+        return self._live_log_process_state(thread_id) == LIVE_PROCESS_STATE_LIVE
 
     def _delete_thread_index_row(self, thread_id: str) -> None:
         """Delete one SQLite thread row and its spawn edges.
@@ -1124,9 +1329,9 @@ class ThreadRepository:
         @returns None.
         """
 
-        database_uri = f"file:{self._database_path}"
-        connection = sqlite3.connect(database_uri, uri=True)
+        connection = self._connect_state_db(False)
         try:
+            connection.execute("BEGIN IMMEDIATE")
             connection.execute("DELETE FROM threads WHERE id = ?", (thread_id,))
             if self._table_exists(connection, "thread_spawn_edges"):
                 connection.execute(
@@ -1151,25 +1356,42 @@ class ThreadRepository:
         @returns True when the thread should be treated as active or unstable.
         """
 
-        if self.thread_has_live_process(thread_id):
+        if self._live_log_process_state(thread_id) != LIVE_PROCESS_STATE_NOT_LIVE:
             return True
         return self._rollout_recently_modified(rollout_path)
 
-    def _has_live_log_process(self, thread_id: str) -> bool:
+    def _assert_thread_can_archive(self, thread_id: str, rollout_path: Path) -> None:
+        """Raise when a thread may still be active.
+
+        @param thread_id The thread id to test.
+        @param rollout_path The active rollout path for the thread.
+        @returns None.
+        """
+
+        live_state = self._live_log_process_state(thread_id)
+        if live_state == LIVE_PROCESS_STATE_LIVE:
+            raise RuntimeError(ACTIVE_THREAD_ARCHIVE_MESSAGE)
+        if live_state == LIVE_PROCESS_STATE_UNKNOWN:
+            raise RuntimeError(ACTIVE_THREAD_UNKNOWN_MESSAGE)
+        if self._rollout_recently_modified(rollout_path):
+            raise RuntimeError(ACTIVE_THREAD_ARCHIVE_MESSAGE)
+
+    def _live_log_process_state(self, thread_id: str) -> str:
         """Return whether recent logs point to a still-running Codex process.
 
         @param thread_id The thread id to inspect in Codex logs.
-        @returns True when a recent process_uuid pid is still running.
+        @returns live, not_live, or unknown.
         """
 
         logs_db_path = resolve_codex_logs_db_path(self._codex_home_path)
         if not logs_db_path.exists():
-            return False
+            return LIVE_PROCESS_STATE_NOT_LIVE
 
         database_uri = f"file:{logs_db_path}?mode=ro"
         try:
             connection = sqlite3.connect(database_uri, uri=True)
             try:
+                connection.execute("PRAGMA busy_timeout = 5000")
                 rows = connection.execute(
                     """
                     SELECT process_uuid
@@ -1184,14 +1406,14 @@ class ThreadRepository:
             finally:
                 connection.close()
         except (OSError, sqlite3.Error):
-            return False
+            return LIVE_PROCESS_STATE_UNKNOWN
 
         for row in rows:
             process_uuid = str(row[0] or "")
             match = PROCESS_UUID_PATTERN.match(process_uuid)
             if match and self._is_pid_running(int(match.group(1))):
-                return True
-        return False
+                return LIVE_PROCESS_STATE_LIVE
+        return LIVE_PROCESS_STATE_NOT_LIVE
 
     def _is_pid_running(self, pid: int) -> bool:
         """Return whether a Windows process id is still running.
@@ -1238,8 +1460,8 @@ class ThreadRepository:
         """
 
         sessions_root = self._codex_home_path / "sessions"
-        if not self._is_path_under(active_path, sessions_root):
-            raise RuntimeError(f"Active rollout is outside the sessions directory: {active_path}")
+        if not self._is_active_rollout_location(active_path, sessions_root):
+            raise RuntimeError(f"Active rollout is outside the sessions date tree: {active_path}")
 
         archived_root = self._codex_home_path / "archived_sessions"
         archived_root.mkdir(parents=True, exist_ok=True)
@@ -1259,16 +1481,10 @@ class ThreadRepository:
         """
 
         archived_root = self._codex_home_path / "archived_sessions"
-        if rollout_path_text:
-            stored_path = Path(rollout_path_text)
-            candidate = stored_path if stored_path.is_absolute() else self._codex_home_path / stored_path
-            if candidate.exists() and candidate.is_file() and self._is_path_under(candidate, archived_root):
-                return candidate
-        if archived_root.exists():
-            for candidate in archived_root.rglob(f"*{thread_id}*.jsonl"):
-                if candidate.exists() and candidate.is_file() and self._is_path_under(candidate, archived_root):
-                    return candidate
-        raise FileNotFoundError(f"Archived rollout was not found for thread: {thread_id}")
+        stored_candidate = self._stored_rollout_candidate(rollout_path_text, archived_root, archived=True)
+        if stored_candidate is not None and self._rollout_matches_thread(stored_candidate, thread_id, archived=True):
+            return stored_candidate
+        return self._find_rollout_by_thread_id(archived_root, thread_id, archived=True)
 
     def _restore_archived_rollout(self, archived_path: Path) -> Path:
         """Move an archived rollout into the active sessions tree.
@@ -1282,7 +1498,7 @@ class ThreadRepository:
         if not match:
             raise RuntimeError(f"Archived rollout filename does not contain a session date: {file_name}")
 
-        year, month, day = match.groups()
+        year, month, day, _thread_uuid = match.groups()
         dest_dir = self._codex_home_path / "sessions" / year / month / day
         dest_dir.mkdir(parents=True, exist_ok=True)
         restored_path = dest_dir / file_name
@@ -1305,6 +1521,40 @@ class ThreadRepository:
         except ValueError:
             return False
         return True
+
+    def _is_direct_child(self, path: Path, parent: Path) -> bool:
+        """Return whether a path is a direct child of a directory.
+
+        @param path The path to test.
+        @param parent The expected parent directory.
+        @returns True when the resolved path's parent is the resolved directory.
+        """
+
+        try:
+            return path.resolve().parent == parent.resolve()
+        except OSError:
+            return False
+
+    def _is_active_rollout_location(self, path: Path, sessions_root: Path) -> bool:
+        """Return whether a path is in sessions/YYYY/MM/DD.
+
+        @param path The rollout path to test.
+        @param sessions_root The Codex sessions root directory.
+        @returns True when the path is in the active rollout date tree.
+        """
+
+        try:
+            relative_parent = path.resolve().parent.relative_to(sessions_root.resolve())
+        except (OSError, ValueError):
+            return False
+        parts = relative_parent.parts
+        return (
+            len(parts) == 3
+            and len(parts[0]) == 4
+            and len(parts[1]) == 2
+            and len(parts[2]) == 2
+            and all(part.isdigit() for part in parts)
+        )
 
     def _table_exists(self, connection: sqlite3.Connection, table_name: str) -> bool:
         """Return whether a SQLite table exists.
