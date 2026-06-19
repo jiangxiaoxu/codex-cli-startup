@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import ctypes
+import io
 import json
 import os
+import queue
 import re
 import shutil
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -77,10 +80,13 @@ DEFAULT_DETAIL_SPLITTER_SIZES = (560, 170)
 DEFAULT_COLUMN_WIDTHS = (420, 260, 165, 100)
 ROLLOUT_FILE_PATTERN = re.compile(
     r"^rollout-(\d{4})-(\d{2})-(\d{2})T.+-"
-    r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\.jsonl$"
+    r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"
+    r"\.jsonl(?:\.zst)?$"
 )
 PROCESS_UUID_PATTERN = re.compile(r"^pid:(\d+):.+$")
 CODEX_LOGS_DB_FILENAME = "logs_2.sqlite"
+APP_SERVER_THREAD_LIST_TIMEOUT_SECONDS = 8
+APP_SERVER_UNSUPPORTED_ERROR_CODES = {-32601}
 ACTIVE_ROLLOUT_MTIME_GRACE_SECONDS = 90
 ACTIVE_THREAD_ARCHIVE_MESSAGE = "Thread appears active. Exit the Codex session before archiving."
 ACTIVE_THREAD_UNKNOWN_MESSAGE = "Thread activity could not be confirmed. Refresh Codex logs before archiving."
@@ -96,7 +102,48 @@ ALL_WORKSPACES_SELECTION = "__all_workspaces__"
 OTHER_WORKSPACES_SELECTION = "__other_workspaces__"
 FIXED_WORKSPACE_ROW_COUNT = 2
 TITLE_DISPLAY_LIMIT = 120
-INTERACTIVE_CHAT_SOURCES = {"cli", "vscode", "codex", "atlas", "chatgpt"}
+ROLLOUT_GLOB_PATTERNS = ("*.jsonl", "*.jsonl.zst")
+INTERACTIVE_CHAT_SOURCES = {"cli", "vscode"}
+SOURCE_LABELS = {
+    "cli": "CLI",
+    "vscode": "VSCode",
+    "exec": "Exec",
+    "mcp": "AppServer",
+    "appserver": "AppServer",
+    "subagent": "SubAgent",
+    "subagentreview": "SubAgentReview",
+    "subagentcompact": "SubAgentCompact",
+    "subagentthreadspawn": "SubAgentThreadSpawn",
+    "subagentother": "SubAgentOther",
+    "internal": "Internal",
+    "unknown": "Unknown",
+}
+SUBAGENT_SOURCE_KEYS = {
+    "subagent": "subagent",
+    "sub_agent": "subagent",
+    "sub-agent": "subagent",
+    "subagentreview": "subagentreview",
+    "subagent_review": "subagentreview",
+    "sub-agent-review": "subagentreview",
+    "subagentcompact": "subagentcompact",
+    "subagent_compact": "subagentcompact",
+    "sub-agent-compact": "subagentcompact",
+    "subagentthreadspawn": "subagentthreadspawn",
+    "subagent_thread_spawn": "subagentthreadspawn",
+    "sub-agent-thread-spawn": "subagentthreadspawn",
+    "subagentother": "subagentother",
+    "subagent_other": "subagentother",
+    "sub-agent-other": "subagentother",
+}
+THREAD_SOURCE_KEYS = {
+    "subagent": "subagent",
+    "review": "subagentreview",
+    "compact": "subagentcompact",
+    "thread_spawn": "subagentthreadspawn",
+    "threadspawn": "subagentthreadspawn",
+    "other": "subagentother",
+    "memory_consolidation": "internal",
+}
 
 
 def set_windows_app_user_model_id(app_id: str) -> None:
@@ -170,6 +217,262 @@ class ThreadUsageStats:
     last_input_tokens: int | None = None
     last_cached_input_tokens: int | None = None
     model_context_window: int | None = None
+
+
+@dataclass(slots=True)
+class ThreadDeletePlan:
+    thread_ids: list[str]
+    archived_paths: dict[str, Path]
+
+
+class AppServerThreadRequestRejected(RuntimeError):
+    def __init__(self, request_id: int, code: int | None, message: str) -> None:
+        """Initialize a non-fallback app-server request error.
+
+        @param request_id The request id that received the error.
+        @param code The app-server error code, or None when absent.
+        @param message The app-server error message.
+        @returns None.
+        """
+
+        self.request_id = request_id
+        self.code = code
+        self.message = message
+        super().__init__(f"app-server returned an error for response id {request_id}: {message}")
+
+
+class AppServerThreadRequestUnsupported(RuntimeError):
+    pass
+
+
+class AppServerThreadClient:
+    def __init__(self, codex_home_path: Path, timeout_seconds: int = APP_SERVER_THREAD_LIST_TIMEOUT_SECONDS) -> None:
+        """Initialize a one-shot Codex app-server thread list client.
+
+        @param codex_home_path The Codex home directory app-server should read.
+        @param timeout_seconds The maximum time to wait for the stdio request.
+        @returns None.
+        """
+
+        self._codex_home_path = codex_home_path
+        self._timeout_seconds = timeout_seconds
+
+    def list_threads(self, archived_only: bool) -> list[dict[str, object]]:
+        """Return app-server thread/list data.
+
+        @param archived_only Whether archived threads should be requested.
+        @returns The raw Thread objects returned by app-server.
+        """
+
+        result = self._request(
+            "thread/list",
+            {
+                "archived": archived_only,
+                "sourceKinds": ["cli", "vscode"],
+                "sortKey": "updated_at",
+                "sortDirection": "desc",
+                "useStateDbOnly": True,
+            },
+        )
+        data = result.get("data")
+        if not isinstance(data, list):
+            raise RuntimeError("app-server thread/list response did not include a data array.")
+        threads: list[dict[str, object]] = []
+        for item in data:
+            if not isinstance(item, dict):
+                raise RuntimeError("app-server thread/list response included a non-object thread.")
+            threads.append(item)
+        return threads
+
+    def archive_thread(self, thread_id: str) -> None:
+        """Archive a thread through app-server.
+
+        @param thread_id The thread id to archive.
+        @returns None.
+        """
+
+        self._thread_lifecycle_request("thread/archive", thread_id)
+
+    def unarchive_thread(self, thread_id: str) -> dict[str, object]:
+        """Unarchive a thread through app-server.
+
+        @param thread_id The thread id to unarchive.
+        @returns The raw app-server Thread object when returned.
+        """
+
+        result = self._thread_lifecycle_request("thread/unarchive", thread_id)
+        thread = result.get("thread")
+        return thread if isinstance(thread, dict) else {}
+
+    def delete_thread(self, thread_id: str) -> None:
+        """Delete an archived thread through app-server.
+
+        @param thread_id The archived thread id to delete.
+        @returns None.
+        """
+
+        self._thread_lifecycle_request("thread/delete", thread_id)
+
+    def _thread_lifecycle_request(self, method: str, thread_id: str) -> dict[str, object]:
+        return self._request(method, {"threadId": thread_id})
+
+    def _request(self, method: str, params: dict[str, object]) -> dict[str, object]:
+        messages = [
+            {
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "clientInfo": {
+                        "name": "codex-cli-startup",
+                        "title": "Codex CLI Startup",
+                        "version": "0",
+                    },
+                    "capabilities": None,
+                },
+            },
+            {"method": "initialized"},
+            {"id": 2, "method": method, "params": params},
+        ]
+        responses = self._run_messages(messages)
+        self._response_result(responses, 1)
+        return self._response_result(responses, 2)
+
+    def _resolve_codex_executable(self) -> str:
+        """Resolve the Codex CLI executable for subprocess execution.
+
+        @param None.
+        @returns The best executable path or command name for Codex CLI.
+        """
+
+        candidates = ("codex.exe", "codex.cmd", "codex.bat", "codex") if os.name == "nt" else ("codex",)
+        for candidate in candidates:
+            resolved = shutil.which(candidate)
+            if resolved:
+                return resolved
+        return "codex"
+
+    def _run_messages(self, messages: Sequence[dict[str, object]]) -> dict[int, dict[str, object]]:
+        env = os.environ.copy()
+        env["CODEX_HOME"] = str(self._codex_home_path)
+        creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        process = subprocess.Popen(
+            [self._resolve_codex_executable(), "app-server", "--stdio"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+            creationflags=creationflags,
+        )
+        stdout_queue: queue.Queue[str] = queue.Queue()
+        stderr_lines: list[str] = []
+        stdout_thread = threading.Thread(
+            target=self._read_pipe_lines,
+            args=(process.stdout, stdout_queue),
+            daemon=True,
+        )
+        stderr_thread = threading.Thread(
+            target=self._collect_pipe_lines,
+            args=(process.stderr, stderr_lines),
+            daemon=True,
+        )
+        stdout_thread.start()
+        stderr_thread.start()
+        responses: dict[int, dict[str, object]] = {}
+        try:
+            self._write_message(process, messages[0])
+            responses[1] = self._read_response(process, stdout_queue, 1, stderr_lines)
+            for message in messages[1:]:
+                self._write_message(process, message)
+            responses[2] = self._read_response(process, stdout_queue, 2, stderr_lines)
+        finally:
+            self._close_process(process)
+        return responses
+
+    def _write_message(self, process: subprocess.Popen[str], message: dict[str, object]) -> None:
+        if process.stdin is None:
+            raise RuntimeError("app-server stdin is not available.")
+        process.stdin.write(json.dumps(message, ensure_ascii=False, separators=(",", ":")) + "\n")
+        process.stdin.flush()
+
+    def _read_response(
+        self,
+        process: subprocess.Popen[str],
+        stdout_queue: queue.Queue[str],
+        request_id: int,
+        stderr_lines: list[str],
+    ) -> dict[str, object]:
+        deadline = time.monotonic() + self._timeout_seconds
+        while True:
+            remaining_seconds = deadline - time.monotonic()
+            if remaining_seconds <= 0:
+                raise RuntimeError(f"app-server response id {request_id} timed out.")
+            try:
+                line = stdout_queue.get(timeout=min(remaining_seconds, 0.1))
+            except queue.Empty:
+                if process.poll() is not None:
+                    error_text = "".join(stderr_lines).strip()
+                    raise RuntimeError(f"app-server exited before response id {request_id}: {error_text}")
+                continue
+            if not line.strip():
+                continue
+            try:
+                decoded = json.loads(line)
+            except json.JSONDecodeError as error:
+                raise RuntimeError("app-server emitted invalid JSON.") from error
+            if not isinstance(decoded, dict):
+                continue
+            response_id = _coerce_optional_int(decoded.get("id"))
+            if response_id == request_id:
+                return decoded
+
+    def _close_process(self, process: subprocess.Popen[str]) -> None:
+        if process.stdin is not None:
+            process.stdin.close()
+        try:
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            process.terminate()
+            try:
+                process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=1)
+
+    def _read_pipe_lines(self, pipe: object, output_queue: queue.Queue[str]) -> None:
+        if pipe is None:
+            return
+        for line in iter(pipe.readline, ""):
+            output_queue.put(line)
+
+    def _collect_pipe_lines(self, pipe: object, lines: list[str]) -> None:
+        if pipe is None:
+            return
+        for line in iter(pipe.readline, ""):
+            lines.append(line)
+
+    def _response_result(self, responses: dict[int, dict[str, object]], request_id: int) -> dict[str, object]:
+        response = responses.get(request_id)
+        if response is None:
+            raise RuntimeError(f"app-server did not return response id {request_id}.")
+        error = response.get("error")
+        if error is not None:
+            code: int | None = None
+            message = str(error)
+            if isinstance(error, dict):
+                code = _coerce_optional_int(error.get("code"))
+                message = str(error.get("message") or message)
+            if code in APP_SERVER_UNSUPPORTED_ERROR_CODES or "method not found" in message.lower():
+                raise AppServerThreadRequestUnsupported(
+                    f"app-server does not support response id {request_id}: {message}"
+                )
+            raise AppServerThreadRequestRejected(request_id, code, message)
+        result = response.get("result")
+        if not isinstance(result, dict):
+            raise RuntimeError(f"app-server response id {request_id} did not include an object result.")
+        return result
 
 
 def normalize_workspace_path(path_text: str) -> str:
@@ -352,20 +655,49 @@ def format_compact_number(value: int | None) -> str:
     return str(value)
 
 
-def _is_subagent_source(raw_source: str) -> bool:
+def _thread_source_key(raw_thread_source: str) -> str:
+    """Return the source key implied by Codex thread_source.
+
+    @param raw_thread_source The stored thread_source value from SQLite.
+    @returns A normalized source key, or an empty string when it does not override source.
+    """
+
+    thread_source = raw_thread_source.strip().lower()
+    if not thread_source or thread_source == "user":
+        return ""
+    return THREAD_SOURCE_KEYS.get(thread_source, "subagentother")
+
+
+def _combined_source_key(raw_source: str, raw_thread_source: str = "") -> str:
+    """Return the effective Codex source kind key.
+
+    @param raw_source The serialized session source value from SQLite.
+    @param raw_thread_source The optional thread_source value from SQLite.
+    @returns A lowercase source key suitable for filtering and display.
+    """
+
+    thread_source_key = _thread_source_key(raw_thread_source)
+    return thread_source_key or _source_key(raw_source)
+
+
+def _is_subagent_source(raw_source: str, raw_thread_source: str = "") -> bool:
     """Return whether a serialized thread source represents a subagent.
 
     @param raw_source The serialized source value from SQLite.
+    @param raw_thread_source The optional thread_source value from SQLite.
     @returns True when the source is a subagent variant.
     """
 
+    thread_source_key = _thread_source_key(raw_thread_source)
+    if thread_source_key.startswith("subagent"):
+        return True
     source_text = raw_source.strip()
     if not source_text:
         return False
     source_key = source_text.lower()
     if source_key.startswith("subagent"):
         return True
-    if source_key in {"cli", "vscode", "exec", "mcp", "unknown"}:
+    if source_key.startswith("internal_") or source_key in {"cli", "vscode", "exec", "mcp", "unknown"}:
         return False
 
     try:
@@ -387,7 +719,15 @@ def _source_key(raw_source: str) -> str:
         return ""
     if not source_text.startswith("{"):
         source_key = source_text.lower()
-        return "subagent" if source_key.startswith("subagent") else source_key
+        if source_key in SUBAGENT_SOURCE_KEYS:
+            return SUBAGENT_SOURCE_KEYS[source_key]
+        if source_key.startswith("subagent"):
+            return "subagent"
+        if source_key.startswith("internal_"):
+            return "internal"
+        if source_key in {"appserver", "app-server", "app_server"}:
+            return "mcp"
+        return source_key
 
     try:
         parsed = json.loads(source_text)
@@ -396,7 +736,8 @@ def _source_key(raw_source: str) -> str:
     if not isinstance(parsed, dict):
         return source_text.lower()
     if "subagent" in parsed:
-        return "subagent"
+        subagent_kind = str(parsed["subagent"]).strip().lower()
+        return SUBAGENT_SOURCE_KEYS.get(f"subagent_{subagent_kind}", "subagent")
     if "custom" in parsed:
         return str(parsed["custom"]).strip().lower()
     if "internal" in parsed:
@@ -406,24 +747,29 @@ def _source_key(raw_source: str) -> str:
     return source_text.lower()
 
 
-def _is_interactive_chat_source(raw_source: str) -> bool:
+def _is_interactive_chat_source(raw_source: str, raw_thread_source: str = "") -> bool:
     """Return whether the source belongs to Codex interactive chat sessions.
 
     @param raw_source The serialized source value from SQLite.
+    @param raw_thread_source The optional thread_source value from SQLite.
     @returns True for sources shown by the Chats view.
     """
 
-    return _source_key(raw_source) in INTERACTIVE_CHAT_SOURCES
+    return _combined_source_key(raw_source, raw_thread_source) in INTERACTIVE_CHAT_SOURCES
 
 
-def _display_source(raw_source: str) -> str:
+def _display_source(raw_source: str, raw_thread_source: str = "") -> str:
     """Return a short user-facing source label.
 
     @param raw_source The serialized source value from SQLite.
+    @param raw_thread_source The optional thread_source value from SQLite.
     @returns A compact source label for the table.
     """
 
-    return "CLI" if _source_key(raw_source) == "cli" else "Non-CLI"
+    source_key = _combined_source_key(raw_source, raw_thread_source)
+    if not source_key:
+        return "Unknown"
+    return SOURCE_LABELS.get(source_key, source_key[:1].upper() + source_key[1:])
 
 
 class ThreadTableDelegate(QStyledItemDelegate):
@@ -730,7 +1076,7 @@ class ThreadRepository:
         thread_view: str,
         known_workspace_paths: Sequence[str] = (),
     ) -> list[ThreadRecord]:
-        """Load threads from the SQLite index.
+        """Load threads from Codex app-server.
 
         @param workspace_path The selected workspace path.
         @param archived_only Whether only archived threads should be shown.
@@ -752,16 +1098,126 @@ class ThreadRepository:
         normalized_known_workspaces = {
             normalize_workspace_path(path_text) for path_text in known_workspace_paths if path_text.strip()
         }
-        connection = self._connect_state_db(True)
+        return self._load_threads_from_app_server(
+            archived_only,
+            thread_scope,
+            thread_view,
+            normalized_workspace,
+            normalized_known_workspaces,
+        )
 
+    def _load_threads_from_app_server(
+        self,
+        archived_only: bool,
+        thread_scope: str,
+        thread_view: str,
+        normalized_workspace: str,
+        normalized_known_workspaces: set[str],
+    ) -> list[ThreadRecord]:
+        """Load threads through `codex app-server --stdio`.
+
+        @param archived_only Whether only archived threads should be shown.
+        @param thread_scope The normalized workspace scope to apply.
+        @param thread_view The normalized thread view to apply.
+        @param normalized_workspace The selected workspace path normalized for comparison.
+        @param normalized_known_workspaces The configured workspace paths normalized for Other scope.
+        @returns A list of app-server-backed thread records.
+        """
+
+        app_server_threads = AppServerThreadClient(self._codex_home_path).list_threads(archived_only)
+        rollout_index = self._build_rollout_index()
+        records: list[ThreadRecord] = []
+        for thread in app_server_threads:
+            thread_id = str(thread.get("id") or "")
+            if not thread_id:
+                raise RuntimeError("app-server returned a thread without an id.")
+            cwd = str(thread.get("cwd") or "")
+            if thread_scope == THREAD_SCOPE_WORKSPACE and normalize_workspace_path(cwd) != normalized_workspace:
+                continue
+            if thread_scope == THREAD_SCOPE_OTHER_WORKSPACES and normalize_workspace_path(cwd) in normalized_known_workspaces:
+                continue
+
+            source = (
+                json.dumps(thread["source"], ensure_ascii=False)
+                if isinstance(thread.get("source"), dict)
+                else str(thread.get("source") or "")
+            )
+            thread_source = str(thread.get("threadSource") or "")
+            if thread.get("parentThreadId") is not None or _is_subagent_source(source, thread_source):
+                continue
+            if thread_view == THREAD_VIEW_CHATS and not _is_interactive_chat_source(source, thread_source):
+                continue
+
+            sort_timestamp, updated_text = format_timestamp(thread.get("updatedAt"))
+            _created_sort_timestamp, created_text = format_timestamp(thread.get("createdAt"))
+            title = truncate_first_line(str(thread.get("name") or "").strip(), TITLE_DISPLAY_LIMIT)
+            first_user_message = str(thread.get("preview") or "").strip()
+            summary = truncate_text(first_user_message, 160)
+            if thread_view == THREAD_VIEW_CHATS and not title and not summary:
+                continue
+            display_title = title or summary or thread_id
+            git_info = thread.get("gitInfo")
+            git_info_dict = git_info if isinstance(git_info, dict) else {}
+            rollout_path = str(thread.get("path") or "")
+
+            records.append(
+                ThreadRecord(
+                    thread_id=thread_id,
+                    title=display_title,
+                    created_at_text=created_text,
+                    updated_at_text=updated_text,
+                    source=_display_source(source, thread_source),
+                    cwd=cwd,
+                    model="",
+                    model_provider=str(thread.get("modelProvider") or ""),
+                    reasoning_effort="",
+                    rollout_path=rollout_path,
+                    first_user_message=first_user_message,
+                    summary=summary,
+                    archived=archived_only,
+                    rollout_missing=self._rollout_missing(rollout_path, thread_id, archived_only, rollout_index),
+                    sort_timestamp=sort_timestamp,
+                    tokens_used=0,
+                    cli_version=str(thread.get("cliVersion") or ""),
+                    git_branch=str(git_info_dict.get("branch") or ""),
+                    git_sha=str(git_info_dict.get("sha") or ""),
+                )
+            )
+
+        records.sort(key=lambda item: (item.sort_timestamp, item.thread_id), reverse=True)
+        return records
+
+    def count_orphan_subagent_threads(
+        self,
+        workspace_path: str,
+        archived_only: bool,
+        thread_scope: str,
+        known_workspace_paths: Sequence[str] = (),
+    ) -> int:
+        """Count hidden suspected subagent threads without a spawn parent edge.
+
+        @param workspace_path The selected workspace path.
+        @param archived_only Whether only archived threads are currently shown.
+        @param thread_scope The workspace scope to apply.
+        @param known_workspace_paths The configured workspace paths used by the Other scope.
+        @returns The number of suspected orphan subagent rows hidden from the normal list.
+        """
+
+        if thread_scope not in {
+            THREAD_SCOPE_WORKSPACE,
+            THREAD_SCOPE_ALL_WORKSPACES,
+            THREAD_SCOPE_OTHER_WORKSPACES,
+        }:
+            thread_scope = THREAD_SCOPE_WORKSPACE
+        normalized_workspace = normalize_workspace_path(workspace_path)
+        normalized_known_workspaces = {
+            normalize_workspace_path(path_text) for path_text in known_workspace_paths if path_text.strip()
+        }
+        connection = self._connect_state_db(True)
         try:
             columns = self._table_columns(connection, "threads")
             if not columns:
                 raise RuntimeError("The threads table is missing or could not be introspected.")
-
-            updated_column = "updated_at_ms" if "updated_at_ms" in columns else (
-                "updated_at" if "updated_at" in columns else "created_at"
-            )
             edge_columns = self._table_columns(connection, "thread_spawn_edges")
             child_thread_ids: set[str] = set()
             if "child_thread_id" in edge_columns:
@@ -772,38 +1228,16 @@ class ThreadRepository:
                 }
             select_parts = [
                 '"id" AS "thread_id"' if "id" in columns else "'' AS thread_id",
-                '"rollout_path" AS "rollout_path"' if "rollout_path" in columns else "'' AS rollout_path",
-                '"title" AS "title"' if "title" in columns else "'' AS title",
-                '"created_at_ms" AS "created_at"' if "created_at_ms" in columns else (
-                    '"created_at" AS "created_at"' if "created_at" in columns else "0 AS created_at"
-                ),
-                f'"{updated_column}" AS "updated_at"' if updated_column in columns else "0 AS updated_at",
                 '"cwd" AS "cwd"' if "cwd" in columns else "'' AS cwd",
-                '"model" AS "model"' if "model" in columns else "'' AS model",
-                '"model_provider" AS "model_provider"' if "model_provider" in columns else "'' AS model_provider",
-                '"reasoning_effort" AS "reasoning_effort"' if "reasoning_effort" in columns else "'' AS reasoning_effort",
-                '"source" AS "source"' if "source" in columns else "'' AS source",
-                '"first_user_message" AS "first_user_message"'
-                if "first_user_message" in columns
-                else "'' AS first_user_message",
                 '"archived" AS "archived"' if "archived" in columns else "0 AS archived",
-                '"tokens_used" AS "tokens_used"' if "tokens_used" in columns else "0 AS tokens_used",
-                '"cli_version" AS "cli_version"' if "cli_version" in columns else "'' AS cli_version",
-                '"git_branch" AS "git_branch"' if "git_branch" in columns else "'' AS git_branch",
-                '"git_sha" AS "git_sha"' if "git_sha" in columns else "'' AS git_sha",
+                '"source" AS "source"' if "source" in columns else "'' AS source",
+                '"thread_source" AS "thread_source"' if "thread_source" in columns else "'' AS thread_source",
             ]
-
-            rows = connection.execute(
-                f"""
-                SELECT {", ".join(select_parts)}
-                FROM threads
-                ORDER BY {updated_column} DESC, thread_id DESC
-                """
-            ).fetchall()
+            rows = connection.execute(f"SELECT {', '.join(select_parts)} FROM threads").fetchall()
         finally:
             connection.close()
 
-        records: list[ThreadRecord] = []
+        orphan_count = 0
         for row in rows:
             thread_id = str(row["thread_id"] or "")
             cwd = str(row["cwd"] or "")
@@ -811,52 +1245,14 @@ class ThreadRepository:
                 continue
             if thread_scope == THREAD_SCOPE_OTHER_WORKSPACES and normalize_workspace_path(cwd) in normalized_known_workspaces:
                 continue
-
             archived_flag = bool(int(row["archived"] or 0))
             if archived_flag != archived_only:
                 continue
             source = str(row["source"] or "")
-            is_subagent = _is_subagent_source(source) or thread_id in child_thread_ids
-            if is_subagent:
-                continue
-            if thread_view == THREAD_VIEW_CHATS and not _is_interactive_chat_source(source):
-                continue
-
-            sort_timestamp, updated_text = format_timestamp(row["updated_at"])
-            _created_sort_timestamp, created_text = format_timestamp(row["created_at"])
-            title = truncate_first_line(str(row["title"] or "").strip(), TITLE_DISPLAY_LIMIT)
-            first_user_message = str(row["first_user_message"] or "").strip()
-            summary = truncate_text(first_user_message, 160)
-            if thread_view == THREAD_VIEW_CHATS and not title and not summary:
-                continue
-            display_title = title or summary or thread_id
-
-            records.append(
-                ThreadRecord(
-                    thread_id=thread_id,
-                    title=display_title,
-                    created_at_text=created_text,
-                    updated_at_text=updated_text,
-                    source=_display_source(source),
-                    cwd=cwd,
-                    model=str(row["model"] or ""),
-                    model_provider=str(row["model_provider"] or ""),
-                    reasoning_effort=str(row["reasoning_effort"] or ""),
-                    rollout_path=str(row["rollout_path"] or ""),
-                    first_user_message=first_user_message,
-                    summary=summary,
-                    archived=archived_flag,
-                    rollout_missing=self._rollout_missing(str(row["rollout_path"] or ""), thread_id, archived_flag),
-                    sort_timestamp=sort_timestamp,
-                    tokens_used=_coerce_optional_int(row["tokens_used"]) or 0,
-                    cli_version=str(row["cli_version"] or ""),
-                    git_branch=str(row["git_branch"] or ""),
-                    git_sha=str(row["git_sha"] or ""),
-                )
-            )
-
-        records.sort(key=lambda item: (item.sort_timestamp, item.thread_id), reverse=True)
-        return records
+            thread_source = str(row["thread_source"] or "")
+            if _is_subagent_source(source, thread_source) and thread_id not in child_thread_ids:
+                orphan_count += 1
+        return orphan_count
 
     def load_thread_usage_stats(self, thread: ThreadRecord) -> ThreadUsageStats:
         """Load token and activity stats from a thread rollout file.
@@ -924,76 +1320,73 @@ class ThreadRepository:
             stats.model_context_window = context_window
 
     def unarchive_thread(self, thread_id: str) -> Path:
-        """Move an archived thread rollout back to sessions and update SQLite.
+        """Unarchive a thread through Codex app-server.
 
         @param thread_id The thread id to unarchive.
         @returns The restored rollout path.
         """
 
-        connection = self._connect_state_db(False)
-        restored_path: Path | None = None
-        archived_path: Path | None = None
-        try:
-            columns = self._require_thread_write_schema(connection)
-            connection.execute("BEGIN IMMEDIATE")
-            row = connection.execute(
-                "SELECT id, rollout_path, archived FROM threads WHERE id = ?",
-                (thread_id,),
-            ).fetchone()
-            if row is None:
-                raise RuntimeError(f"Thread was not found: {thread_id}")
-            if not bool(int(row["archived"] or 0)):
-                raise RuntimeError("The selected thread is not archived.")
+        app_server_thread = AppServerThreadClient(self._codex_home_path).unarchive_thread(thread_id)
+        rollout_path_text = str(app_server_thread.get("path") or "")
+        return self._resolve_active_rollout_path(rollout_path_text, thread_id)
 
-            archived_path = self._resolve_archived_rollout_path(str(row["rollout_path"] or ""), thread_id)
-            restored_path = self._restore_archived_rollout(archived_path)
-            self._update_thread_archive_state(connection, columns, thread_id, restored_path, False, None)
-            connection.commit()
-            return restored_path
-        except Exception:
-            connection.rollback()
-            if restored_path is not None and archived_path is not None:
-                self._move_rollout_back(restored_path, archived_path)
-            raise
-        finally:
-            connection.close()
+    def _thread_ids_with_spawn_descendants(self, connection: sqlite3.Connection, thread_ids: Sequence[str]) -> list[str]:
+        """Return thread ids plus transitive spawned descendants.
+
+        @param connection The SQLite connection to inspect.
+        @param thread_ids The root thread ids.
+        @returns Ordered unique thread ids including descendants.
+        """
+
+        ordered_ids: list[str] = []
+        seen_ids: set[str] = set()
+        pending_ids = list(thread_ids)
+        has_spawn_edges = self._table_exists(connection, "thread_spawn_edges")
+        while pending_ids:
+            current_id = pending_ids.pop(0)
+            if current_id in seen_ids:
+                continue
+            seen_ids.add(current_id)
+            ordered_ids.append(current_id)
+            if not has_spawn_edges:
+                continue
+            child_rows = connection.execute(
+                "SELECT child_thread_id FROM thread_spawn_edges WHERE parent_thread_id = ?",
+                (current_id,),
+            ).fetchall()
+            pending_ids.extend(str(row["child_thread_id"]) for row in child_rows if row["child_thread_id"])
+        return ordered_ids
+
+    def _thread_rows_by_id(
+        self,
+        connection: sqlite3.Connection,
+        thread_ids: Sequence[str],
+    ) -> dict[str, sqlite3.Row]:
+        """Load thread rows keyed by id.
+
+        @param connection The SQLite connection to inspect.
+        @param thread_ids The thread ids to load.
+        @returns Existing thread rows keyed by id.
+        """
+
+        if not thread_ids:
+            return {}
+        placeholders = ", ".join("?" for _thread_id in thread_ids)
+        rows = connection.execute(
+            f"SELECT id, rollout_path, archived FROM threads WHERE id IN ({placeholders})",
+            tuple(thread_ids),
+        ).fetchall()
+        return {str(row["id"]): row for row in rows}
 
     def archive_thread(self, thread_id: str) -> Path:
-        """Move an active thread rollout to archived_sessions and update SQLite.
+        """Archive a thread through Codex app-server.
 
         @param thread_id The thread id to archive.
         @returns The archived rollout path.
         """
 
-        connection = self._connect_state_db(False)
-        active_path: Path | None = None
-        archived_path: Path | None = None
-        try:
-            columns = self._require_thread_write_schema(connection)
-            connection.execute("BEGIN IMMEDIATE")
-            row = connection.execute(
-                "SELECT id, rollout_path, archived FROM threads WHERE id = ?",
-                (thread_id,),
-            ).fetchone()
-            if row is None:
-                raise RuntimeError(f"Thread was not found: {thread_id}")
-            if bool(int(row["archived"] or 0)):
-                raise RuntimeError("The selected thread is already archived.")
-
-            active_path = self._resolve_active_rollout_path(str(row["rollout_path"] or ""), thread_id)
-            self._assert_thread_can_archive(thread_id, active_path)
-            archived_path = self._archive_active_rollout(active_path)
-            archived_at = int(datetime.now().timestamp())
-            self._update_thread_archive_state(connection, columns, thread_id, archived_path, True, archived_at)
-            connection.commit()
-            return archived_path
-        except Exception:
-            connection.rollback()
-            if archived_path is not None and active_path is not None:
-                self._move_rollout_back(archived_path, active_path)
-            raise
-        finally:
-            connection.close()
+        AppServerThreadClient(self._codex_home_path).archive_thread(thread_id)
+        return self._resolve_archived_rollout_path("", thread_id)
 
     def delete_archived_thread(self, thread_id: str) -> None:
         """Delete one archived thread rollout and SQLite index row.
@@ -1002,48 +1395,125 @@ class ThreadRepository:
         @returns None.
         """
 
+        self._delete_archived_thread_ids_app_server([thread_id])
+
+    def _delete_archived_thread_ids_app_server(self, thread_ids: Sequence[str]) -> int:
+        """Delete archived threads through app-server.
+
+        @param thread_ids The selected archived root thread ids.
+        @returns The best available count of deleted thread rows including descendants.
+        """
+
+        if not thread_ids:
+            return 0
+
+        completed_count = 0
+        for thread_id in thread_ids:
+            AppServerThreadClient(self._codex_home_path).delete_thread(thread_id)
+            completed_count += 1
+        return completed_count
+
+    def _count_delete_plan_thread_ids(self, thread_ids: Sequence[str]) -> int:
+        """Return the local delete target count without blocking app-server deletion.
+
+        @param thread_ids The selected archived root thread ids.
+        @returns The number of local rows that would be deleted, or root count when unavailable.
+        """
+
+        connection: sqlite3.Connection | None = None
+        try:
+            connection = self._connect_state_db(True)
+            plan = self._build_delete_plan(connection, thread_ids)
+            return len(plan.thread_ids)
+        except Exception:
+            return len(thread_ids)
+        finally:
+            if connection is not None:
+                connection.close()
+
+    def _build_delete_plan(
+        self,
+        connection: sqlite3.Connection,
+        root_thread_ids: Sequence[str],
+    ) -> ThreadDeletePlan:
+        """Precheck archived thread deletion including spawned descendants.
+
+        @param connection The SQLite connection to inspect.
+        @param root_thread_ids The selected root thread ids.
+        @returns A delete plan with thread ids and existing rollout paths.
+        """
+
+        thread_ids = self._thread_ids_with_spawn_descendants(connection, root_thread_ids)
+        rows_by_id = self._thread_rows_by_id(connection, thread_ids)
+        for root_thread_id in root_thread_ids:
+            if root_thread_id not in rows_by_id:
+                raise RuntimeError(f"Thread was not found: {root_thread_id}")
+
+        delete_ids: list[str] = []
+        archived_paths: dict[str, Path] = {}
+        for current_id in thread_ids:
+            row = rows_by_id.get(current_id)
+            if row is None:
+                continue
+            if not bool(int(row["archived"] or 0)):
+                raise RuntimeError("Only archived threads can be deleted.")
+            delete_ids.append(current_id)
+            try:
+                archived_paths[current_id] = self._resolve_archived_rollout_path(
+                    str(row["rollout_path"] or ""),
+                    current_id,
+                )
+            except FileNotFoundError:
+                pass
+        return ThreadDeletePlan(thread_ids=delete_ids, archived_paths=archived_paths)
+
+    def _delete_archived_thread_ids(self, thread_ids: Sequence[str]) -> int:
+        """Delete archived threads and spawned descendants after prechecks.
+
+        @param thread_ids The selected archived root thread ids.
+        @returns The number of SQLite thread rows deleted.
+        """
+
         connection = self._connect_state_db(False)
-        archived_path: Path | None = None
-        staged_path: Path | None = None
+        staged_paths: list[tuple[Path, Path]] = []
         committed = False
         try:
             self._require_thread_write_schema(connection)
             connection.execute("BEGIN IMMEDIATE")
-            row = connection.execute(
-                "SELECT id, rollout_path, archived FROM threads WHERE id = ?",
-                (thread_id,),
-            ).fetchone()
-            if row is None:
-                raise RuntimeError(f"Thread was not found: {thread_id}")
-            if not bool(int(row["archived"] or 0)):
-                raise RuntimeError("Only archived threads can be deleted.")
-
-            try:
-                archived_path = self._resolve_archived_rollout_path(str(row["rollout_path"] or ""), thread_id)
-            except FileNotFoundError:
-                archived_path = None
-            if archived_path is not None:
+            plan = self._build_delete_plan(connection, thread_ids)
+            for archived_path in plan.archived_paths.values():
                 staged_path = self._stage_rollout_for_delete(archived_path)
-            connection.execute("DELETE FROM threads WHERE id = ?", (thread_id,))
-            if self._table_exists(connection, "thread_spawn_edges"):
+                staged_paths.append((staged_path, archived_path))
+
+            if plan.thread_ids:
+                placeholders = ", ".join("?" for _thread_id in plan.thread_ids)
                 connection.execute(
-                    """
-                    DELETE FROM thread_spawn_edges
-                    WHERE parent_thread_id = ? OR child_thread_id = ?
-                    """,
-                    (thread_id, thread_id),
+                    f"DELETE FROM threads WHERE id IN ({placeholders})",
+                    tuple(plan.thread_ids),
                 )
+            if self._table_exists(connection, "thread_spawn_edges"):
+                placeholders = ", ".join("?" for _thread_id in plan.thread_ids)
+                if placeholders:
+                    connection.execute(
+                        f"""
+                        DELETE FROM thread_spawn_edges
+                        WHERE parent_thread_id IN ({placeholders})
+                           OR child_thread_id IN ({placeholders})
+                        """,
+                        tuple(plan.thread_ids) + tuple(plan.thread_ids),
+                    )
             connection.commit()
             committed = True
-            if staged_path is not None:
+            for staged_path, _archived_path in staged_paths:
                 try:
                     staged_path.unlink()
                 except OSError:
                     pass
+            return len(plan.thread_ids)
         except Exception:
             if not committed:
                 connection.rollback()
-            if not committed and staged_path is not None and archived_path is not None:
+            for staged_path, archived_path in reversed(staged_paths):
                 self._move_rollout_back(staged_path, archived_path)
             raise
         finally:
@@ -1140,11 +1610,7 @@ class ThreadRepository:
         """
 
         records = self.load_threads(workspace_path, True, thread_scope, thread_view, known_workspace_paths)
-        deleted_count = 0
-        for record in records:
-            self.delete_archived_thread(record.thread_id)
-            deleted_count += 1
-        return deleted_count
+        return self._delete_archived_thread_ids_app_server([record.thread_id for record in records])
 
     def delete_missing_rollout_threads(
         self,
@@ -1175,11 +1641,17 @@ class ThreadRepository:
             deleted_count += 1
         return deleted_count
 
-    def _resolve_active_rollout_path(self, rollout_path_text: str, thread_id: str) -> Path:
+    def _resolve_active_rollout_path(
+        self,
+        rollout_path_text: str,
+        thread_id: str,
+        rollout_index: dict[tuple[bool, str], list[Path]] | None = None,
+    ) -> Path:
         """Resolve the active rollout path for a thread.
 
         @param rollout_path_text The rollout path stored in SQLite.
         @param thread_id The thread id to locate.
+        @param rollout_index Optional per-refresh rollout filename index.
         @returns The active rollout path.
         """
 
@@ -1187,22 +1659,32 @@ class ThreadRepository:
         stored_candidate = self._stored_rollout_candidate(rollout_path_text, sessions_root, archived=False)
         if stored_candidate is not None and self._rollout_matches_thread(stored_candidate, thread_id, archived=False):
             return stored_candidate
+        indexed_candidate = self._rollout_from_index(rollout_index, thread_id, archived=False)
+        if indexed_candidate is not None:
+            return indexed_candidate
         return self._find_rollout_by_thread_id(sessions_root, thread_id, archived=False)
 
-    def _rollout_missing(self, rollout_path_text: str, thread_id: str, archived: bool) -> bool:
+    def _rollout_missing(
+        self,
+        rollout_path_text: str,
+        thread_id: str,
+        archived: bool,
+        rollout_index: dict[tuple[bool, str], list[Path]] | None = None,
+    ) -> bool:
         """Return whether a thread index row has no matching rollout file.
 
         @param rollout_path_text The rollout path stored in SQLite.
         @param thread_id The thread id to locate.
         @param archived Whether the thread is marked archived in SQLite.
+        @param rollout_index Optional per-refresh rollout filename index.
         @returns True when no matching rollout exists in the expected tree.
         """
 
         try:
             if archived:
-                self._resolve_archived_rollout_path(rollout_path_text, thread_id)
+                self._resolve_archived_rollout_path(rollout_path_text, thread_id, rollout_index)
             else:
-                self._resolve_active_rollout_path(rollout_path_text, thread_id)
+                self._resolve_active_rollout_path(rollout_path_text, thread_id, rollout_index)
         except FileNotFoundError:
             return True
         return False
@@ -1229,6 +1711,76 @@ class ThreadRepository:
             return None
         return candidate
 
+    def _build_rollout_index(self) -> dict[tuple[bool, str], list[Path]]:
+        """Build one rollout filename index for the current refresh.
+
+        @param None.
+        @returns A mapping from archive state and thread id to rollout paths.
+        """
+
+        rollout_index: dict[tuple[bool, str], list[Path]] = {}
+        for archived, root in (
+            (False, self._codex_home_path / "sessions"),
+            (True, self._codex_home_path / "archived_sessions"),
+        ):
+            if not root.exists():
+                continue
+            for candidate in self._iter_rollout_candidates(root, archived):
+                thread_id = self._thread_id_from_rollout_filename(candidate.name)
+                if thread_id:
+                    rollout_index.setdefault((archived, thread_id), []).append(candidate)
+        return rollout_index
+
+    def _rollout_from_index(
+        self,
+        rollout_index: dict[tuple[bool, str], list[Path]] | None,
+        thread_id: str,
+        archived: bool,
+    ) -> Path | None:
+        """Resolve a rollout from a per-refresh filename index.
+
+        @param rollout_index The index created for the current refresh.
+        @param thread_id The thread id to locate.
+        @param archived Whether the rollout should be archived.
+        @returns The indexed rollout path, or None when absent.
+        """
+
+        if rollout_index is None:
+            return None
+        matches = [
+            candidate
+            for candidate in rollout_index.get((archived, thread_id.lower()), [])
+            if self._rollout_matches_thread(candidate, thread_id, archived)
+        ]
+        if len(matches) > 1:
+            match_text = "\n".join(str(path) for path in matches)
+            raise RuntimeError(f"Multiple rollout files match thread {thread_id}:\n{match_text}")
+        return matches[0] if matches else None
+
+    def _iter_rollout_candidates(self, root: Path, archived: bool) -> list[Path]:
+        """Return rollout candidate files below a rollout root.
+
+        @param root The active or archived rollout root.
+        @param archived Whether the root is the archived rollout root.
+        @returns Rollout candidate paths for plain and compressed files.
+        """
+
+        candidates: list[Path] = []
+        for pattern in ROLLOUT_GLOB_PATTERNS:
+            iterator = root.glob(pattern) if archived else root.rglob(pattern)
+            candidates.extend(iterator)
+        return candidates
+
+    def _thread_id_from_rollout_filename(self, file_name: str) -> str | None:
+        """Return the thread id encoded in a rollout filename.
+
+        @param file_name The rollout filename to inspect.
+        @returns The lowercase thread id, or None when the filename does not match.
+        """
+
+        match = ROLLOUT_FILE_PATTERN.match(file_name)
+        return match.group(4).lower() if match else None
+
     def _find_rollout_by_thread_id(self, root: Path, thread_id: str, archived: bool) -> Path:
         """Find a rollout by exact thread id and session metadata.
 
@@ -1242,10 +1794,9 @@ class ThreadRepository:
             location = "archived" if archived else "active"
             raise FileNotFoundError(f"{location.title()} rollout was not found for thread: {thread_id}")
 
-        iterator = root.glob("*.jsonl") if archived else root.rglob("*.jsonl")
         matches = [
             candidate
-            for candidate in iterator
+            for candidate in self._iter_rollout_candidates(root, archived)
             if self._rollout_matches_thread(candidate, thread_id, archived)
         ]
         if len(matches) > 1:
@@ -1286,8 +1837,7 @@ class ThreadRepository:
         @returns True when the filename matches the Codex rollout pattern and id.
         """
 
-        match = ROLLOUT_FILE_PATTERN.match(file_name)
-        return bool(match and match.group(4).lower() == thread_id.lower())
+        return self._thread_id_from_rollout_filename(file_name) == thread_id.lower()
 
     def _rollout_session_meta_matches_thread(self, rollout_path: Path, thread_id: str) -> bool:
         """Return whether the rollout head contains matching session metadata.
@@ -1297,11 +1847,7 @@ class ThreadRepository:
         @returns True when the first JSONL item is session metadata for the thread.
         """
 
-        try:
-            with rollout_path.open("r", encoding="utf-8", errors="replace") as rollout_file:
-                first_line = rollout_file.readline()
-        except OSError:
-            return False
+        first_line = self._read_rollout_first_line(rollout_path)
         if not first_line:
             return False
         try:
@@ -1312,6 +1858,47 @@ class ThreadRepository:
             return False
         payload = item.get("payload")
         return isinstance(payload, dict) and str(payload.get("id") or "").lower() == thread_id.lower()
+
+    def _read_rollout_first_line(self, rollout_path: Path) -> str:
+        """Read the first JSONL line from a plain or zstandard-compressed rollout.
+
+        @param rollout_path The rollout file path to inspect.
+        @returns The first decoded line, or an empty string when it cannot be read safely.
+        """
+
+        try:
+            if rollout_path.name.lower().endswith(".jsonl.zst"):
+                return self._read_zstandard_rollout_first_line(rollout_path)
+            with rollout_path.open("r", encoding="utf-8", errors="replace") as rollout_file:
+                return rollout_file.readline()
+        except OSError:
+            return ""
+
+    def _read_zstandard_rollout_first_line(self, rollout_path: Path) -> str:
+        """Read the first line from a zstandard-compressed rollout.
+
+        @param rollout_path The compressed rollout file path.
+        @returns The first decoded line, or an empty string when decompression fails.
+        """
+
+        try:
+            import zstandard
+        except ImportError:
+            return ""
+
+        try:
+            with rollout_path.open("rb") as compressed_file:
+                reader = zstandard.ZstdDecompressor().stream_reader(compressed_file)
+                try:
+                    text_reader = io.TextIOWrapper(reader, encoding="utf-8", errors="replace")
+                    try:
+                        return text_reader.readline()
+                    finally:
+                        text_reader.close()
+                finally:
+                    reader.close()
+        except (OSError, zstandard.ZstdError):
+            return ""
 
     def thread_has_live_process(self, thread_id: str) -> bool:
         """Return whether Codex logs point to a still-running process for a thread.
@@ -1472,11 +2059,17 @@ class ThreadRepository:
         os.utime(archived_path, None)
         return archived_path
 
-    def _resolve_archived_rollout_path(self, rollout_path_text: str, thread_id: str) -> Path:
+    def _resolve_archived_rollout_path(
+        self,
+        rollout_path_text: str,
+        thread_id: str,
+        rollout_index: dict[tuple[bool, str], list[Path]] | None = None,
+    ) -> Path:
         """Resolve the archived rollout path for a thread.
 
         @param rollout_path_text The rollout path stored in SQLite.
         @param thread_id The thread id to locate.
+        @param rollout_index Optional per-refresh rollout filename index.
         @returns The archived rollout path.
         """
 
@@ -1484,6 +2077,9 @@ class ThreadRepository:
         stored_candidate = self._stored_rollout_candidate(rollout_path_text, archived_root, archived=True)
         if stored_candidate is not None and self._rollout_matches_thread(stored_candidate, thread_id, archived=True):
             return stored_candidate
+        indexed_candidate = self._rollout_from_index(rollout_index, thread_id, archived=True)
+        if indexed_candidate is not None:
+            return indexed_candidate
         return self._find_rollout_by_thread_id(archived_root, thread_id, archived=True)
 
     def _restore_archived_rollout(self, archived_path: Path) -> Path:
@@ -1652,6 +2248,7 @@ class MainWindow(QMainWindow):
         self._threads: list[ThreadRecord] = []
         self._thread_stats_cache: dict[str, ThreadUsageStats] = {}
         self._missing_rollout_count = 0
+        self._orphan_subagent_count = 0
 
         self.setWindowTitle("codex-cli-startup")
         self.resize(*self._config.ui_state.window_size)
@@ -2067,6 +2664,7 @@ class MainWindow(QMainWindow):
         if workspace is None and thread_scope == THREAD_SCOPE_WORKSPACE:
             self._threads = []
             self._missing_rollout_count = 0
+            self._orphan_subagent_count = 0
             self._thread_table.setRowCount(0)
             self._thread_status_label.setText("No workspace configured.")
             self._update_action_state()
@@ -2080,9 +2678,16 @@ class MainWindow(QMainWindow):
                 thread_view,
                 self._configured_workspace_paths(),
             )
+            self._orphan_subagent_count = self._repository.count_orphan_subagent_threads(
+                workspace.path if workspace else "",
+                self._archived_toggle.isChecked(),
+                thread_scope,
+                self._configured_workspace_paths(),
+            )
         except Exception as error:  # noqa: BLE001
             self._threads = []
             self._missing_rollout_count = 0
+            self._orphan_subagent_count = 0
             self._thread_table.setRowCount(0)
             self._thread_status_label.setText("Failed to load threads.")
             self._update_action_state()
@@ -2124,9 +2729,15 @@ class MainWindow(QMainWindow):
         archived_text = "only" if self._archived_toggle.isChecked() else "hidden"
         self._missing_rollout_count = missing_rollout_count
         missing_text = f" | Missing rollout: {missing_rollout_count}" if missing_rollout_count else ""
+        orphan_text = (
+            f" | Hidden orphan subagents: {self._orphan_subagent_count}"
+            if self._orphan_subagent_count
+            else ""
+        )
         self._thread_status_label.setText(
             f"Threads: {len(self._threads)} | Scope: {scope_text} | "
-            f"Archived: {archived_text}{missing_text} | Workspace: {workspace_text} | DB: {self._repository.database_path}"
+            f"Archived: {archived_text}{missing_text}{orphan_text} | "
+            f"Workspace: {workspace_text} | DB: {self._repository.database_path}"
         )
         self._thread_table.resizeRowsToContents()
         self._update_action_state()
@@ -2257,7 +2868,7 @@ class MainWindow(QMainWindow):
         confirmation = QMessageBox.question(
             self,
             "Archive Thread",
-            f"Archive this thread?\n\n{thread.title}\n{thread.thread_id}",
+            f"Archive this thread?\n\n{thread.title}\n{thread.thread_id}{self._orphan_subagent_notice()}",
         )
         if confirmation != QMessageBox.StandardButton.Yes:
             return
@@ -2302,7 +2913,8 @@ class MainWindow(QMainWindow):
         confirmation = QMessageBox.question(
             self,
             "Delete Thread",
-            f"Delete this archived thread permanently?\n\n{thread.title}\n{thread.thread_id}",
+            f"Delete this archived thread permanently?\n\n{thread.title}\n{thread.thread_id}"
+            f"{self._orphan_subagent_notice()}",
         )
         if confirmation != QMessageBox.StandardButton.Yes:
             return
@@ -2339,7 +2951,8 @@ class MainWindow(QMainWindow):
         confirmation = QMessageBox.question(
             self,
             "Delete All Archived",
-            f"Delete all {len(self._threads)} archived threads in {scope_text} permanently?",
+            f"Delete all {len(self._threads)} archived threads in {scope_text} permanently?"
+            f"{self._orphan_subagent_notice()}",
         )
         if confirmation != QMessageBox.StandardButton.Yes:
             return
@@ -2358,7 +2971,7 @@ class MainWindow(QMainWindow):
         QMessageBox.information(
             self,
             "Delete All Archived",
-            f"Deleted {deleted_count} archived threads.",
+            f"Deleted {deleted_count} archived threads.{self._orphan_subagent_notice()}",
         )
         self._refresh_threads()
 
@@ -2379,7 +2992,8 @@ class MainWindow(QMainWindow):
             self,
             "Clean Orphaned",
             f"Clean {self._missing_rollout_count} orphaned thread records in {scope_text}?\n\n"
-            "Only SQLite index rows with missing rollout files will be removed.",
+            "Only SQLite index rows with missing rollout files will be removed."
+            f"{self._orphan_subagent_notice()}",
         )
         if confirmation != QMessageBox.StandardButton.Yes:
             return
@@ -2399,9 +3013,25 @@ class MainWindow(QMainWindow):
         QMessageBox.information(
             self,
             "Clean Orphaned",
-            f"Cleaned {deleted_count} orphaned thread records.",
+            f"Cleaned {deleted_count} orphaned thread records.{self._orphan_subagent_notice()}",
         )
         self._refresh_threads()
+
+    def _orphan_subagent_notice(self) -> str:
+        """Return UI text describing hidden orphan subagents in the current scope.
+
+        @param None.
+        @returns A leading-newline notice, or an empty string when there are no hidden orphan subagents.
+        """
+
+        if self._orphan_subagent_count <= 0:
+            return ""
+        noun = "thread" if self._orphan_subagent_count == 1 else "threads"
+        verb = "is" if self._orphan_subagent_count == 1 else "are"
+        return (
+            f"\n\n{self._orphan_subagent_count} orphan subagent {noun} "
+            f"{verb} hidden and will not be changed automatically."
+        )
 
     def _validated_selected_thread(self, dialog_title: str, allow_archived: bool = False) -> ThreadRecord | None:
         thread = self._selected_thread()
@@ -2492,15 +3122,18 @@ class MainWindow(QMainWindow):
         except OSError as error:
             QMessageBox.critical(self, "Launch Failed", f"Failed to open a new PowerShell window.\n\n{error}")
 
-    def _find_command_source(self, command_name: str, terminal_path: str) -> str | None:
-        direct_path = shutil.which(command_name)
-        if direct_path:
-            return direct_path
+    def _find_command_source(self, command_name: str, shell_path: str) -> str | None:
+        """Find a command as resolved by the launch shell.
+
+        @param command_name The command name to find.
+        @param shell_path The PowerShell executable used for the launch.
+        @returns The command source reported by PowerShell, or None.
+        """
 
         try:
             completed = subprocess.run(  # noqa: S603
                 [
-                    terminal_path,
+                    shell_path,
                     "-NoLogo",
                     "-NoProfile",
                     "-Command",
