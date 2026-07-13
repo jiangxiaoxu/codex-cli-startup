@@ -522,6 +522,21 @@ class WorkspaceManagementScreen(Screen[tuple[Workspace, ...]]):
             self._complete_add,
         )
 
+    def action_move_cursor(self, direction: int) -> None:
+        """Move the highlighted project within the management list.
+
+        @param direction: Negative for up and positive for down.
+        @returns: None.
+        """
+        project_list = self.query_one("#manage-projects", OptionList)
+        if not self.workspaces:
+            return
+        project_list.focus()
+        if direction < 0:
+            project_list.action_cursor_up()
+        else:
+            project_list.action_cursor_down()
+
     def action_rename_workspace(self) -> None:
         """Prompt for a new name for the highlighted workspace.
 
@@ -812,6 +827,11 @@ class ProjectSelectorApp(App[Workspace | None]):
         @param direction: Negative for up and positive for down.
         @returns: None.
         """
+        current_screen = self.screen
+        if isinstance(current_screen, WorkspaceManagementScreen):
+            current_screen.action_move_cursor(direction)
+            return
+
         project_list = self.query_one("#projects", OptionList)
         if not self._option_workspaces:
             return

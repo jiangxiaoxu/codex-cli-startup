@@ -461,11 +461,13 @@ class ProjectSelectorAppTests(unittest.IsolatedAsyncioTestCase):
             app = list_project.ProjectSelectorApp(workspaces, config_path, root)
 
             async with app.run_test(size=(100, 32)) as pilot:
-                await pilot.press("f2")
-                await pilot.pause()
+                await pilot.press("f2", "down", "down", "up", "down")
                 management = app.screen
                 self.assertIsInstance(management, list_project.WorkspaceManagementScreen)
-                management.query_one("#manage-projects", OptionList).highlighted = 2
+                self.assertEqual(
+                    management.query_one("#manage-projects", OptionList).highlighted,
+                    2,
+                )
                 await pilot.press("t")
                 await pilot.pause()
                 expected = [workspaces[2], workspaces[0], workspaces[1]]
