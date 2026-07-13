@@ -1,6 +1,11 @@
 # codex-cli-startup
 
-这是一个 Windows 专用的 Python GUI 启动器,用于管理常用工作区,并一键恢复 Codex chat threads。
+这是一个 Windows 专用的 Codex workspace 启动工具仓库,包含两个相互独立但共享配置的入口:
+
+- `codex-cli-startup.py`: PySide6 GUI 启动器,用于管理常用 workspaces 和 Codex chat threads。
+- `list_project.py`: Textual CLI 项目选择器,用于在终端中搜索、选择和管理 workspaces,并配合 `list-project.ps1` 切换当前目录。
+
+两个入口默认读取同一份 `codex-cli-startup_config.json`,其中的 workspace 顺序会同时反映在 GUI 和 CLI 项目列表中。
 
 ## 安装
 
@@ -42,6 +47,7 @@ TUI 支持搜索过滤、方向键导航和鼠标选择。按 `Enter` 确认当�
 
 - `A`: 把启动 `list-project.ps1` 时的当前工作目录加入配置,并弹出 Display name 输入框。默认名称为目录名,可以直接输入中文。
 - `R`: 修改当前选中项目的 Display name,项目路径保持不变。
+- `T`: 把当前选中项目移动到配置和项目列表的顶端。
 - `D`: 请求确认后从配置中移除当前选中项目。
 - `Esc`: 返回主选择界面并立即刷新项目列表。
 

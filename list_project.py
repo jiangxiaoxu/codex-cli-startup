@@ -427,6 +427,7 @@ class WorkspaceManagementScreen(Screen[tuple[Workspace, ...]]):
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("a", "add_workspace", "Add", priority=True),
         Binding("r", "rename_workspace", "Rename", priority=True),
+        Binding("t", "move_workspace_to_top", "Move to top", priority=True),
         Binding("d", "delete_workspace", "Remove", priority=True),
         Binding("escape", "close", "Back", priority=True),
     ]
@@ -489,7 +490,10 @@ class WorkspaceManagementScreen(Screen[tuple[Workspace, ...]]):
         with Vertical(id="manage-content"):
             yield Label("Manage projects", id="manage-title")
             yield OptionList(id="manage-projects")
-        yield Static("A: add cwd  R: rename  D: remove  Esc: back", id="manage-status")
+        yield Static(
+            "A: add cwd  R: rename  T: move to top  D: remove  Esc: back",
+            id="manage-status",
+        )
         yield Footer()
 
     def on_mount(self) -> None:
@@ -547,6 +551,28 @@ class WorkspaceManagementScreen(Screen[tuple[Workspace, ...]]):
             return
         self._delete_index = index
         self.app.push_screen(DeleteWorkspaceModal(self.workspaces[index]), self._complete_delete)
+
+    def action_move_workspace_to_top(self) -> None:
+        """Move the highlighted workspace to the start of the configured order.
+
+        @param None.
+        @returns: None.
+        """
+        index = self._selected_index()
+        if index is None:
+            self._set_status("Select a project to move.", error=True)
+            return
+
+        workspace = self.workspaces[index]
+        if index == 0:
+            self._set_status(f"Already at top: {workspace.name}")
+            return
+
+        candidate = [workspace, *self.workspaces[:index], *self.workspaces[index + 1 :]]
+        if self._persist(candidate):
+            self.workspaces = candidate
+            self._refresh_options(highlighted=0)
+            self._set_status(f"Moved to top: {workspace.name}")
 
     def action_close(self) -> None:
         """Return the updated workspace list to the selector.

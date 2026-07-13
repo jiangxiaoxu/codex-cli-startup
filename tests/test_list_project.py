@@ -437,6 +437,58 @@ class ProjectSelectorAppTests(unittest.IsolatedAsyncioTestCase):
                 [{"name": "外部项目新名称", "path": str(external_path)}],
             )
 
+    async def test_management_moves_selected_workspace_to_top(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_directory:
+            root = Path(temp_directory)
+            config_path = root / "config.json"
+            workspaces = [
+                list_project.Workspace("Alpha", str(root / "Alpha")),
+                list_project.Workspace("Beta", str(root / "Beta")),
+                list_project.Workspace("Gamma", str(root / "Gamma")),
+            ]
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "workspaces": [
+                            {"name": workspace.name, "path": workspace.path}
+                            for workspace in workspaces
+                        ],
+                        "terminal": "preserved",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            app = list_project.ProjectSelectorApp(workspaces, config_path, root)
+
+            async with app.run_test(size=(100, 32)) as pilot:
+                await pilot.press("f2")
+                await pilot.pause()
+                management = app.screen
+                self.assertIsInstance(management, list_project.WorkspaceManagementScreen)
+                management.query_one("#manage-projects", OptionList).highlighted = 2
+                await pilot.press("t")
+                await pilot.pause()
+                expected = [workspaces[2], workspaces[0], workspaces[1]]
+                self.assertEqual(management.workspaces, expected)
+                self.assertEqual(
+                    management.query_one("#manage-projects", OptionList).highlighted,
+                    0,
+                )
+                status = str(management.query_one("#manage-status", Static).render())
+                self.assertIn("Moved to top: Gamma", status)
+
+                await pilot.press("escape")
+                await pilot.pause()
+                self.assertEqual(app.workspaces, tuple(expected))
+                await pilot.press("escape")
+
+            saved = json.loads(config_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                [workspace["name"] for workspace in saved["workspaces"]],
+                ["Gamma", "Alpha", "Beta"],
+            )
+            self.assertEqual(saved["terminal"], "preserved")
+
     async def test_management_list_selection_does_not_exit_selector(self) -> None:
         with tempfile.TemporaryDirectory() as temp_directory:
             root = Path(temp_directory)
