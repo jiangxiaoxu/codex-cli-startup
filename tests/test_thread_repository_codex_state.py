@@ -237,6 +237,72 @@ class ThreadRepositoryCodexStateTests(unittest.TestCase):
         self._app_server_patch.stop()
         self._temp_dir.cleanup()
 
+    def test_main_reports_missing_local_app_data_and_exits(self) -> None:
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch.object(APP, "set_windows_app_user_model_id"),
+            mock.patch.object(APP, "QApplication"),
+            mock.patch.object(APP, "APP_ICON_PATH", Path("missing-icon.ico")),
+            mock.patch.object(APP.QMessageBox, "critical") as critical,
+        ):
+            exit_code = APP.main()
+
+        self.assertEqual(exit_code, 1)
+        critical.assert_called_once()
+        self.assertIn("LOCALAPPDATA", str(critical.call_args.args[2]))
+
+    def test_gui_ui_save_preserves_external_workspace_changes(self) -> None:
+        import list_project
+
+        config_path = self.codex_home / "config" / "codex-cli-startup_config.json"
+        original_workspace = APP.WorkspaceEntry("Original", str(self.codex_home / "original"))
+        APP.save_app_config(config_path, APP.AppConfig(workspaces=[original_workspace]))
+        raw_config = json.loads(config_path.read_text(encoding="utf-8"))
+        raw_config["custom"] = {"preserve": True}
+        config_path.write_text(json.dumps(raw_config), encoding="utf-8")
+
+        with mock.patch.dict(os.environ, {"QT_QPA_PLATFORM": "offscreen"}):
+            application = APP.QApplication.instance() or APP.QApplication([])
+            window = APP.MainWindow(config_path, self.state_db, self.codex_home)
+            external_workspace = list_project.Workspace("外部项目", str(self.codex_home / "external"))
+            list_project.save_workspaces(
+                config_path,
+                [external_workspace],
+                expected_workspaces=[
+                    list_project.Workspace(original_workspace.name, original_workspace.path)
+                ],
+            )
+
+            self.assertTrue(window._persist_ui_state())
+            self.assertEqual(window._workspace_list.item(2).text(), external_workspace.name)
+            window._workspace_list.setCurrentRow(2)
+            self.assertEqual(window._selected_workspace().path, external_workspace.path)
+            application.processEvents()
+            window.close()
+
+        saved = json.loads(config_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            saved["workspaces"],
+            [{"name": external_workspace.name, "path": external_workspace.path}],
+        )
+        self.assertEqual(saved["custom"], {"preserve": True})
+
+    def test_gui_ui_save_recovers_invalid_json_without_lock_reentry(self) -> None:
+        config_path = self.codex_home / "config" / "codex-cli-startup_config.json"
+        APP.save_app_config(config_path, APP.AppConfig())
+
+        with mock.patch.dict(os.environ, {"QT_QPA_PLATFORM": "offscreen"}):
+            application = APP.QApplication.instance() or APP.QApplication([])
+            window = APP.MainWindow(config_path, self.state_db, self.codex_home)
+            config_path.write_text("{", encoding="utf-8")
+
+            self.assertTrue(window._persist_ui_state())
+            application.processEvents()
+            window.close()
+
+        saved = json.loads(config_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["workspaces"], [])
+
     def _create_state_db(self, path: Path) -> None:
         connection = _connect(path)
         try:

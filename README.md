@@ -9,8 +9,8 @@ python setup_env.py
 ```
 
 依赖会安装到仓库根目录的 `.venv`,不要安装到宿主 Python 环境。
-`requirements.txt` 固定为 `PySide6>=6.7,<7`。
-选择这个范围是因为它兼容当前 `Python 3.13.6`, API 已经稳定,同时避免锁到未来可能带来兼容变化的大版本。
+`requirements.txt` 包含 `PySide6>=6.7,<7`、`textual>=8.2,<9` 和 Codex rollout 压缩文件支持。PySide6 用于 GUI,Textual 用于 CLI 项目导航 TUI。
+这些范围兼容当前 `Python 3.13.6`,同时避免自动升级到可能带来兼容变化的大版本。
 
 ## 启动
 
@@ -27,6 +27,47 @@ Windows 下如果你不想看到额外的空白控制台窗口,优先使用:
 也可以直接双击 [codex-cli-startup.pyw](G:\Project\codex-cli-startup\codex-cli-startup.pyw)。
 
 仓库根目录还包含已入库的 `codex-cli-startup.exe`,双击它会通过 `.venv\Scripts\pythonw.exe` 拉起 `codex-cli-startup.py`。如果 `.venv` 不存在,它会回退到 `pythonw.exe`。这个 wrapper 依赖同目录的 `codex-cli-startup.dll`,`codex-cli-startup.deps.json`,`codex-cli-startup.runtimeconfig.json`。
+
+## CLI 项目导航
+
+在 PowerShell 中运行以下命令,可以打开 Textual TUI,按 `codex-cli-startup_config.json` 的顺序查看项目,并在当前终端中选择目标项目:
+
+```powershell
+.\list-project.ps1
+```
+
+TUI 支持搜索过滤、方向键导航和鼠标选择。按 `Enter` 确认当前项目,按 `Esc` 或 `Ctrl+Q` 取消。选择成功后,当前 PowerShell 会通过 `Set-Location` 切换到目标路径。
+
+在主选择界面按 `F2` 可以进入独立管理模式:
+
+- `A`: 把启动 `list-project.ps1` 时的当前工作目录加入配置,并弹出 Display name 输入框。默认名称为目录名,可以直接输入中文。
+- `R`: 修改当前选中项目的 Display name,项目路径保持不变。
+- `D`: 请求确认后从配置中移除当前选中项目。
+- `Esc`: 返回主选择界面并立即刷新项目列表。
+
+管理操作只修改配置中的 `workspaces`,其他配置字段会保留。配置为空或尚未创建时,无参数启动仍会进入 TUI,可以通过管理模式添加第一个项目。
+
+也可以直接传入项目名称或配置路径,跳过交互列表:
+
+```powershell
+.\list-project.ps1 codex-cli-startup
+.\list-project.ps1 G:/Project/codex-cli-startup
+```
+
+直接选择时,项目名称匹配不区分大小写。如果配置中存在同名项目,请改用完整路径。目标路径不存在时不会切换目录。
+
+这个入口不会修改 PowerShell Profile 或用户 `PATH`。由于目录切换由 PowerShell 脚本自身完成,请直接执行脚本,不要在独立子进程中调用它。
+
+构建不依赖 Python 的独立 CLI exe:
+
+```powershell
+python setup_env.py --build
+.\.venv\Scripts\python.exe build_list_project.py
+```
+
+预期输出为 `dist/list-project.exe`。将 `list-project.exe` 和 `list-project.ps1` 放在同一目录后,PowerShell 脚本会优先调用 exe;仓库开发环境中没有 exe 时才回退到 `.venv` Python 入口。
+
+仓库级 `$deploy-list-project` skill 位于 `.agents/skills/deploy-list-project`。激活该 skill 会重新构建 exe,并通过 `LOCALAPPDATA` 环境变量部署 exe 和 ps1 到 `%LOCALAPPDATA%\codex-cli-startup`;现有配置文件不会被修改。
 
 重新生成这个轻量 wrapper:
 
@@ -52,12 +93,13 @@ python setup_env.py --build
 
 生成的入口位于 [dist/codex-cli-startup.exe](G:\Project\codex-cli-startup\dist\codex-cli-startup.exe)。
 
-exe 使用 `--windowed` 模式,启动时不会显示控制台窗口。打包后配置文件会读写在 exe 同目录的 `codex-cli-startup_config.json`,方便把 `dist` 目录整体挪到固定位置后直接双击运行。
+exe 使用 `--windowed` 模式,启动时不会显示控制台窗口。源码版和打包版使用同一个 `%LOCALAPPDATA%` 配置文件,移动 exe 不会改变配置位置。
 
 ## 配置文件位置
 
-配置文件保存在入口所在目录的 `codex-cli-startup_config.json`。
-源码运行时对应仓库根目录的 [codex-cli-startup_config.json](G:\Project\codex-cli-startup\codex-cli-startup_config.json),exe 运行时对应 exe 同目录的 `codex-cli-startup_config.json`。
+配置文件统一保存在 `%LOCALAPPDATA%\codex-cli-startup\codex-cli-startup_config.json`。程序通过 `LOCALAPPDATA` 环境变量解析当前用户目录,不会硬编码用户名。源码版、轻量 wrapper、CLI 和打包版使用同一个位置。
+
+程序不会读取或自动迁移仓库目录中的旧配置文件。首次启动 GUI 时,如果新位置尚无配置,会自动创建目录和默认配置。需要保留现有 workspace 时,请手动把旧 JSON 复制到上述位置。
 
 结构包含:
 

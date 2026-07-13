@@ -17,6 +17,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Sequence
 
+from config_paths import (
+    ConfigPathError,
+    atomic_write_text,
+    configuration_lock,
+    resolve_config_path,
+)
+
 from PySide6.QtCore import QModelIndex, QRect, Qt, Signal
 from PySide6.QtGui import QBrush, QCloseEvent, QColor, QDragMoveEvent, QDropEvent, QIcon, QPainter
 from PySide6.QtWidgets import (
@@ -46,18 +53,6 @@ from PySide6.QtWidgets import (
 )
 
 
-def resolve_app_dir() -> Path:
-    """Resolve the directory used for app-adjacent config files.
-
-    @param None.
-    @returns The executable directory when frozen, otherwise the source directory.
-    """
-
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent
-    return Path(__file__).resolve().parent
-
-
 def resolve_resource_path(relative_path: str) -> Path:
     """Resolve a source or PyInstaller-bundled resource path.
 
@@ -69,11 +64,8 @@ def resolve_resource_path(relative_path: str) -> Path:
     return bundle_root / relative_path
 
 
-SCRIPT_DIR = resolve_app_dir()
 APP_ICON_PATH = resolve_resource_path("assets/codex-cli-startup.ico")
 APP_USER_MODEL_ID = "codex-cli-startup.app"
-CONFIG_FILENAME = "codex-cli-startup_config.json"
-CONFIG_PATH = SCRIPT_DIR / CONFIG_FILENAME
 DEFAULT_WINDOW_SIZE = (1280, 780)
 DEFAULT_SPLITTER_SIZES = (320, 960)
 DEFAULT_DETAIL_SPLITTER_SIZES = (560, 170)
@@ -900,23 +892,26 @@ class WorkspaceListWidget(QListWidget):
         return ordered_paths
 
 
-def load_app_config(config_path: Path) -> AppConfig:
+def load_app_config(config_path: Path, *, recover: bool = True) -> AppConfig:
     """Load the launcher config and create it when missing.
 
     @param config_path The JSON config file path.
+    @param recover Whether to create a default file when the source is missing or invalid.
     @returns The parsed application config.
     """
 
     if not config_path.exists():
         config = AppConfig()
-        save_app_config(config_path, config)
+        if recover:
+            save_app_config(config_path, config)
         return config
 
     try:
         raw_data = json.loads(config_path.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
         config = AppConfig()
-        save_app_config(config_path, config)
+        if recover:
+            save_app_config(config_path, config)
         return config
     raw_workspaces = raw_data.get("workspaces", [])
     workspaces: list[WorkspaceEntry] = []
@@ -973,23 +968,48 @@ def save_app_config(config_path: Path, config: AppConfig) -> None:
     @param config The configuration to persist.
     @returns None.
     """
+    with configuration_lock(config_path):
+        _save_app_config_locked(config_path, config)
 
-    payload = {
-        "workspaces": [{"name": item.name, "path": item.path} for item in config.workspaces],
-        "terminal": "wt",
-        "ui_state": {
-            "selected_workspace": config.ui_state.selected_workspace,
-            "show_archived": config.ui_state.show_archived,
-            "show_subagents": config.ui_state.show_subagents,
-            "thread_scope": config.ui_state.thread_scope,
-            "thread_view": config.ui_state.thread_view,
-            "window_size": list(config.ui_state.window_size),
-            "splitter_sizes": list(config.ui_state.splitter_sizes),
-            "detail_splitter_sizes": list(config.ui_state.detail_splitter_sizes),
-            "column_widths": list(config.ui_state.column_widths),
-        },
-    }
-    config_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+def _save_app_config_locked(config_path: Path, config: AppConfig) -> None:
+    """Persist app configuration while the caller holds the configuration lock.
+
+    @param config_path The JSON config file path.
+    @param config The configuration to persist.
+    @returns None.
+    """
+
+    payload: dict[str, object] = {}
+    try:
+        raw_payload = json.loads(config_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        pass
+    else:
+        if isinstance(raw_payload, dict):
+            payload = raw_payload
+
+    payload.update(
+        {
+            "workspaces": [{"name": item.name, "path": item.path} for item in config.workspaces],
+            "terminal": "wt",
+            "ui_state": {
+                "selected_workspace": config.ui_state.selected_workspace,
+                "show_archived": config.ui_state.show_archived,
+                "show_subagents": config.ui_state.show_subagents,
+                "thread_scope": config.ui_state.thread_scope,
+                "thread_view": config.ui_state.thread_view,
+                "window_size": list(config.ui_state.window_size),
+                "splitter_sizes": list(config.ui_state.splitter_sizes),
+                "detail_splitter_sizes": list(config.ui_state.detail_splitter_sizes),
+                "column_widths": list(config.ui_state.column_widths),
+            },
+        }
+    )
+    atomic_write_text(
+        config_path,
+        json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
+    )
 
 
 class ThreadRepository:
@@ -2244,6 +2264,9 @@ class MainWindow(QMainWindow):
         super().__init__()
         self._config_path = config_path
         self._config = load_app_config(config_path)
+        self._persisted_workspace_snapshot: tuple[tuple[str, str], ...] = tuple(
+            (workspace.name, workspace.path) for workspace in self._config.workspaces
+        )
         self._repository = ThreadRepository(state_db_path, codex_home_path)
         self._threads: list[ThreadRecord] = []
         self._thread_stats_cache: dict[str, ThreadUsageStats] = {}
@@ -2570,7 +2593,9 @@ class MainWindow(QMainWindow):
         if not self._config.workspaces:
             self._config.ui_state.selected_workspace = ALL_WORKSPACES_SELECTION
             self._config.ui_state.thread_scope = THREAD_SCOPE_ALL_WORKSPACES
-        self._persist_ui_state()
+        if not self._persist_ui_state(workspaces_changed=True):
+            self._populate_workspace_list()
+            return
         self._populate_workspace_list()
 
     def _upsert_workspace(self, workspace: WorkspaceEntry, editing_index: int | None) -> None:
@@ -2591,7 +2616,9 @@ class MainWindow(QMainWindow):
 
         self._config.ui_state.selected_workspace = workspace.path
         self._config.ui_state.thread_scope = THREAD_SCOPE_WORKSPACE
-        self._persist_ui_state()
+        if not self._persist_ui_state(workspaces_changed=True):
+            self._populate_workspace_list()
+            return
         self._populate_workspace_list()
         self._workspace_list.setCurrentRow(target_index)
 
@@ -2633,7 +2660,9 @@ class MainWindow(QMainWindow):
             return
 
         self._config.workspaces = reordered_workspaces
-        self._persist_ui_state()
+        if not self._persist_ui_state(workspaces_changed=True):
+            self._populate_workspace_list()
+            return
         self._update_action_state()
 
     def _set_archived_view(self, archived: bool) -> None:
@@ -3152,21 +3181,73 @@ class MainWindow(QMainWindow):
         source = completed.stdout.strip()
         return source or None
 
-    def _persist_ui_state(self) -> None:
-        self._config.terminal = "wt"
-        self._config.ui_state.window_size = (self.width(), self.height())
-        self._config.ui_state.show_archived = self._archived_toggle.isChecked()
-        self._config.ui_state.show_subagents = False
-        self._config.ui_state.thread_scope = self._current_thread_scope()
-        self._config.ui_state.thread_view = self._current_thread_view()
-        self._config.ui_state.splitter_sizes = tuple(self._splitter.sizes()[:2])
-        detail_splitter_sizes = tuple(self._thread_detail_splitter.sizes()[:2])
-        if self._detail_panel.isVisible() and len(detail_splitter_sizes) == 2 and detail_splitter_sizes[1] > 0:
-            self._config.ui_state.detail_splitter_sizes = detail_splitter_sizes
-        self._config.ui_state.column_widths = tuple(
-            self._thread_table.columnWidth(index) for index in range(self._thread_table.columnCount())
-        )
-        save_app_config(self._config_path, self._config)
+    def _persist_ui_state(self, *, workspaces_changed: bool = False) -> bool:
+        """Persist current UI state without overwriting external workspace changes.
+
+        @param workspaces_changed: Whether this save includes a local workspace mutation.
+        @returns: True when saved, or False when an external workspace conflict was detected.
+        """
+        conflict_detected = False
+        external_workspaces_changed = False
+        with configuration_lock(self._config_path):
+            disk_config = (
+                load_app_config(self._config_path, recover=False)
+                if self._config_path.exists()
+                else AppConfig()
+            )
+            disk_workspace_snapshot = tuple(
+                (workspace.name, workspace.path) for workspace in disk_config.workspaces
+            )
+            external_workspaces_changed = (
+                disk_workspace_snapshot != self._persisted_workspace_snapshot
+            )
+            if workspaces_changed and external_workspaces_changed:
+                self._config.workspaces = disk_config.workspaces
+                self._persisted_workspace_snapshot = disk_workspace_snapshot
+                conflict_detected = True
+            else:
+                if not workspaces_changed:
+                    self._config.workspaces = disk_config.workspaces
+
+                self._config.terminal = "wt"
+                self._config.ui_state.window_size = (self.width(), self.height())
+                self._config.ui_state.show_archived = self._archived_toggle.isChecked()
+                self._config.ui_state.show_subagents = False
+                self._config.ui_state.thread_scope = self._current_thread_scope()
+                self._config.ui_state.thread_view = self._current_thread_view()
+                self._config.ui_state.splitter_sizes = tuple(self._splitter.sizes()[:2])
+                detail_splitter_sizes = tuple(self._thread_detail_splitter.sizes()[:2])
+                if (
+                    self._detail_panel.isVisible()
+                    and len(detail_splitter_sizes) == 2
+                    and detail_splitter_sizes[1] > 0
+                ):
+                    self._config.ui_state.detail_splitter_sizes = detail_splitter_sizes
+                self._config.ui_state.column_widths = tuple(
+                    self._thread_table.columnWidth(index)
+                    for index in range(self._thread_table.columnCount())
+                )
+                _save_app_config_locked(self._config_path, self._config)
+                self._persisted_workspace_snapshot = tuple(
+                    (workspace.name, workspace.path) for workspace in self._config.workspaces
+                )
+
+        if external_workspaces_changed:
+            signals_were_blocked = self._workspace_list.blockSignals(True)
+            try:
+                self._populate_workspace_list()
+            finally:
+                self._workspace_list.blockSignals(signals_were_blocked)
+            self._update_action_state()
+
+        if conflict_detected:
+            QMessageBox.warning(
+                self,
+                "Workspace Configuration Changed",
+                "Workspaces changed in another process. The latest configuration was reloaded.",
+            )
+            return False
+        return True
 
 
 def main() -> int:
@@ -3181,7 +3262,12 @@ def main() -> int:
     app.setApplicationName("codex-cli-startup")
     if APP_ICON_PATH.exists():
         app.setWindowIcon(QIcon(str(APP_ICON_PATH)))
-    window = MainWindow(CONFIG_PATH, resolve_codex_state_db_path(), resolve_codex_home_path())
+    try:
+        config_path = resolve_config_path()
+    except ConfigPathError as error:
+        QMessageBox.critical(None, "Configuration Error", str(error))
+        return 1
+    window = MainWindow(config_path, resolve_codex_state_db_path(), resolve_codex_home_path())
     if APP_ICON_PATH.exists():
         window.setWindowIcon(QIcon(str(APP_ICON_PATH)))
     window.show()
